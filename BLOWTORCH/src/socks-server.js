@@ -1,8 +1,11 @@
+import { WASMWebSocket } from './wasm-bridge.js';
+
 export class SocksServer {
   constructor(options = {}) {
     this.port = options.port || 1080;
     this.websocketUrl = options.websocketUrl;
     this.relayToken = options.relayToken;
+    this.useWASM = options.useWASM || false;
     this.server = null;
     this.ws = null;
     this.reconnectAttempts = 0;
@@ -74,7 +77,16 @@ export class SocksServer {
       }
 
       const url = new URL(this.websocketUrl);
-      this.ws = new WebSocket(url.toString(), [`token.${this.relayToken}`]);
+
+      // Use WASM WebSocket if available and enabled, otherwise fallback to standard WebSocket
+      if (this.useWASM) {
+        console.log('[SocksServer] Using WASM WebSocket implementation');
+        this.ws = new WASMWebSocket(url.toString(), [`token.${this.relayToken}`]);
+      } else {
+        console.log('[SocksServer] Using standard WebSocket implementation');
+        this.ws = new WebSocket(url.toString(), [`token.${this.relayToken}`]);
+      }
+
       const ws = this.ws;
       
       // Use class-level connections map
@@ -202,14 +214,15 @@ export class SocksServer {
                     getWriter: () => ({
                       write: async (chunk) => {
                         console.log(`[${connectionId}] WebSocket writer sending ${chunk.length} bytes`);
-                        if (ws.readyState === WebSocket.OPEN) {
+                        console.log(`[${connectionId}] WebSocket readyState: ${ws.readyState} (OPEN=${WebSocket.OPEN || WASMWebSocket.OPEN || 1})`);
+                        if (ws.readyState === WebSocket.OPEN || ws.readyState === 1) {
                           ws.send(JSON.stringify({
                             type: 'data',
                             connectionId: connectionId,
                             data: btoa(String.fromCharCode.apply(null, chunk))
                           }));
                         } else {
-                          console.warn(`[${connectionId}] Cannot send data - WebSocket not open`);
+                          console.warn(`[${connectionId}] Cannot send data - WebSocket not open (state=${ws.readyState})`);
                         }
                       },
                       close: () => {

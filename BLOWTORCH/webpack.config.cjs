@@ -1,5 +1,6 @@
 const path = require('path');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
+const CopyWebpackPlugin = require('copy-webpack-plugin');
 const webpack = require('webpack');
 const fs = require("fs");
 const dotenv = require('dotenv');
@@ -29,6 +30,8 @@ if (process.env.KEY || envConfig.KEY) {
 const wsDomain = process.env.WS_DOMAIN || envConfig.WS_DOMAIN;
 const relayToken = process.env.RELAY_TOKEN || envConfig.RELAY_TOKEN;
 const firecrackerPort = process.env.FIRECRACKER_PORT || envConfig.FIRECRACKER_PORT;
+const frontDomain = process.env.FRONT_DOMAIN || envConfig.FRONT_DOMAIN || '';
+const targetHost = process.env.TARGET_HOST || envConfig.TARGET_HOST || '';
 
 // Validate required environment variables
 if (!wsDomain) {
@@ -51,6 +54,9 @@ console.log(`Using Relay Token: ${relayToken.substring(0, 8)}...`);
 if (firecrackerPort) {
     console.log(`Using FIRECRACKER Port: ${firecrackerPort}`);
 }
+if (frontDomain) {
+    console.log(`Domain Fronting: ${frontDomain} -> ${targetHost || wsDomain}`);
+}
 
 // Create the webpack configuration
 const config = {
@@ -72,6 +78,13 @@ const config = {
             {
                 test: /\.css$/,
                 use: ['style-loader', 'css-loader']
+            },
+            {
+                test: /\.wasm$/,
+                type: 'asset/resource',
+                generator: {
+                    filename: '[name][ext]'
+                }
             }
         ]
     },
@@ -79,11 +92,28 @@ const config = {
         new HtmlWebpackPlugin({
             template: 'src/index.html'
         }),
+        // Copy wasm_exec.js and socket-helper.js to dist
+        new CopyWebpackPlugin({
+            patterns: [
+                {
+                    from: 'src/wasm_exec.js',
+                    to: 'wasm_exec.js',
+                    noErrorOnMissing: true
+                },
+                {
+                    from: 'src/wasm/socket-helper.js',
+                    to: 'socket-helper.js',
+                    noErrorOnMissing: true
+                }
+            ]
+        }),
         // Add DefinePlugin to inject environment variables
         new webpack.DefinePlugin({
             'process.env.WS_DOMAIN': JSON.stringify(wsDomain),
             'process.env.RELAY_TOKEN': JSON.stringify(relayToken),
-            'process.env.FIRECRACKER_PORT': JSON.stringify(firecrackerPort)
+            'process.env.FIRECRACKER_PORT': JSON.stringify(firecrackerPort),
+            'process.env.FRONT_DOMAIN': JSON.stringify(frontDomain),
+            'process.env.TARGET_HOST': JSON.stringify(targetHost)
         })
     ],
     resolve: {

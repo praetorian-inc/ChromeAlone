@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "build:wasm": "bash scripts/build-wasm.sh",
+    "prebuild:debug": "npm run build:wasm",
     "build:debug": "webpack --config webpack.wbn.cjs --node-env production",
+    "prebuild:prod": "npm run build:wasm",
     "build:prod": "webpack --config webpack.prod.wbn.cjs --node-env production",
     "dev": "webpack --mode development --watch",
     "generate-keys": "node scripts/generate-keys.js"

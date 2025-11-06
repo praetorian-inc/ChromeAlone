@@ -128,12 +128,14 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+.wasm
 
 cert.pem
 package-lock.json
 private.key
 
 output/*
+output-backup/*
 
 .DS_Store
 __pycache__
