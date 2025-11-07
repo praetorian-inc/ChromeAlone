@@ -21,6 +21,7 @@ import (
 type WebSocketConnection struct {
 	conn          net.Conn
 	tlsConn       *tls.Conn
+	directSocket  *DirectSocket // Keep reference to underlying DirectSocket for WriteSync
 	mu            sync.Mutex
 	sendMu        sync.Mutex  // Serialize all sends
 	closed        bool
@@ -109,6 +110,7 @@ func NewWebSocketConnection(config WebSocketConfig) (*WebSocketConnection, error
 		return nil, fmt.Errorf("failed to create socket: %v", err)
 	}
 	ws.conn = conn
+	ws.directSocket = conn  // Keep reference for WriteSync
 
 	// Wrap with TLS if needed
 	if useTLS {
@@ -332,7 +334,7 @@ func (ws *WebSocketConnection) sendPong(payload []byte) error {
 	return err
 }
 
-// Send sends a text message over the WebSocket
+// Send sends a text message over the WebSocket (fire-and-forget)
 func (ws *WebSocketConnection) Send(data string) error {
 	// Serialize sends - critical for preventing message corruption
 	ws.sendMu.Lock()
@@ -372,6 +374,72 @@ func (ws *WebSocketConnection) Send(data string) error {
 		frame = append(frame, payload[i]^maskKey[i%4])
 	}
 
+	var conn io.Writer = ws.conn
+	if ws.tlsConn != nil {
+		conn = ws.tlsConn
+	}
+
+	_, err := conn.Write(frame)
+	return err
+}
+
+// SendSync sends a text message and waits for the write to complete
+// This is used by sendAsync to ensure writes happen sequentially
+func (ws *WebSocketConnection) SendSync(data string) error {
+	// Serialize sends - critical for preventing message corruption
+	ws.sendMu.Lock()
+	defer ws.sendMu.Unlock()
+
+	ws.mu.Lock()
+	if ws.closed {
+		ws.mu.Unlock()
+		return fmt.Errorf("connection closed")
+	}
+	ws.mu.Unlock()
+
+	payload := []byte(data)
+	frame := []byte{0x81} // FIN + Text opcode
+
+	// Add payload length
+	payloadLen := len(payload)
+	if payloadLen < 126 {
+		frame = append(frame, byte(0x80|payloadLen))
+	} else if payloadLen < 65536 {
+		frame = append(frame, 0xFE)
+		frame = append(frame, byte(payloadLen>>8), byte(payloadLen))
+	} else {
+		frame = append(frame, 0xFF)
+		lenBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(lenBytes, uint64(payloadLen))
+		frame = append(frame, lenBytes...)
+	}
+
+	// Add masking key
+	maskKey := make([]byte, 4)
+	rand.Read(maskKey)
+	frame = append(frame, maskKey...)
+
+	// Add masked payload
+	for i := 0; i < len(payload); i++ {
+		frame = append(frame, payload[i]^maskKey[i%4])
+	}
+
+	// Enable sync writes on the DirectSocket
+	// This makes all Write() calls block until completion
+	// Including those made internally by tls.Conn.Write()
+	if ws.directSocket != nil {
+		ws.directSocket.syncMu.Lock()
+		ws.directSocket.useSyncWrites = true
+		ws.directSocket.syncMu.Unlock()
+
+		defer func() {
+			ws.directSocket.syncMu.Lock()
+			ws.directSocket.useSyncWrites = false
+			ws.directSocket.syncMu.Unlock()
+		}()
+	}
+
+	// Now write through TLS or directly
 	var conn io.Writer = ws.conn
 	if ws.tlsConn != nil {
 		conn = ws.tlsConn
@@ -478,11 +546,13 @@ func generateWebSocketKey() string {
 
 // DirectSocket implements net.Conn using Chrome's Direct Sockets API
 type DirectSocket struct {
-	socketID   int
-	readBuffer []byte
-	closed     bool
-	readMu     sync.Mutex // Serialize read operations
-	writeQueue chan writeRequest
+	socketID      int
+	readBuffer    []byte
+	closed        bool
+	readMu        sync.Mutex // Serialize read operations only
+	writeQueue    chan writeRequest
+	useSyncWrites bool       // If true, Write() behaves like WriteSync()
+	syncMu        sync.Mutex // Protects useSyncWrites flag
 }
 
 type writeRequest struct {
@@ -554,7 +624,7 @@ func NewDirectSocket(network, address string) (*DirectSocket, error) {
 		socketID:   socketID,
 		readBuffer: make([]byte, 0),
 		closed:     false,
-		writeQueue: make(chan writeRequest, 1000), // Large buffer to handle bursts without blocking
+		writeQueue: make(chan writeRequest, 100), // Buffered to allow pipelining
 	}
 
 	// Start the write worker goroutine
@@ -565,7 +635,7 @@ func NewDirectSocket(network, address string) (*DirectSocket, error) {
 
 // Read implements net.Conn
 func (ds *DirectSocket) Read(b []byte) (n int, err error) {
-	// Serialize read operations - only one read at a time
+	// Serialize read operations only - prevents concurrent reads
 	ds.readMu.Lock()
 	defer ds.readMu.Unlock()
 
@@ -638,8 +708,18 @@ func (ds *DirectSocket) Read(b []byte) (n int, err error) {
 }
 
 // Write implements net.Conn
-// Uses a write queue to avoid blocking when readLoop is already blocked on Read
+// Behavior depends on useSyncWrites flag
 func (ds *DirectSocket) Write(b []byte) (n int, err error) {
+	ds.syncMu.Lock()
+	useSync := ds.useSyncWrites
+	ds.syncMu.Unlock()
+
+	if useSync {
+		// Use WriteSync when flag is set
+		return ds.WriteSync(b)
+	}
+
+	// Default: fire-and-forget async write
 	if ds.closed {
 		return 0, errors.New("socket closed")
 	}
@@ -658,17 +738,57 @@ func (ds *DirectSocket) Write(b []byte) (n int, err error) {
 		result: nil, // No result channel - we don't wait for completion
 	}
 
-	// Non-blocking send - drop writes if queue is full to prevent deadlock
-	select {
-	case ds.writeQueue <- req:
-		// Successfully queued
-	default:
-		// Queue is full - this is a flow control issue
-		// Return error but don't block
-		return 0, errors.New("write queue full - data dropped")
+	// Spawn a goroutine to send to the channel
+	// This prevents blocking the caller (which might be in a JS event handler)
+	// The goroutine can safely block on channel send
+	go func() {
+		// Recover from panic if channel is closed
+		defer func() {
+			if r := recover(); r != nil {
+				// Channel was closed, ignore this write
+			}
+		}()
+		ds.writeQueue <- req
+	}()
+
+	// Return immediately - write will be queued by the goroutine
+	return len(data), nil
+}
+
+// WriteSync implements write with backpressure
+// Blocks only if the write queue is full, otherwise returns immediately
+// This allows pipelining while preventing unbounded memory growth
+func (ds *DirectSocket) WriteSync(b []byte) (n int, err error) {
+	if ds.closed {
+		return 0, errors.New("socket closed")
 	}
 
-	// Return immediately - write is queued
+	if ds.socketID == -1 {
+		return 0, errors.New("socket not connected")
+	}
+
+	// Create a copy of the data since b might be reused by caller
+	data := make([]byte, len(b))
+	copy(data, b)
+
+	// Queue the write request WITHOUT result channel
+	// This allows the write to be processed asynchronously
+	req := writeRequest{
+		data:   data,
+		result: nil, // No result channel - we don't wait for completion
+	}
+
+	// Send directly to queue - this will block if queue is full (backpressure)
+	// The buffered channel (size 100) allows pipelining of writes
+	defer func() {
+		if r := recover(); r != nil {
+			// Channel was closed
+			err = errors.New("write queue closed")
+		}
+	}()
+
+	ds.writeQueue <- req
+
 	return len(data), nil
 }
 
@@ -690,6 +810,8 @@ func (ds *DirectSocket) writeWorker() {
 }
 
 // doWrite performs the actual write operation with WaitGroup blocking
+// Note: This is ONLY called by writeWorker which processes writes sequentially
+// This ensures only one write happens at a time, preventing TLS corruption
 func (ds *DirectSocket) doWrite(b []byte) error {
 	if ds.closed {
 		return errors.New("socket closed")

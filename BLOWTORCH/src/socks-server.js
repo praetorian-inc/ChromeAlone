@@ -14,6 +14,8 @@ export class SocksServer {
     this.reconnectTimer = null;
     this.isReconnecting = false;
     this.connections = new Map(); // Move connections to class level for persistence across reconnects
+    this.sendQueue = [];
+    this.isSending = false;
   }
 
   async startLocalSOCKSProxy() {
@@ -59,9 +61,53 @@ export class SocksServer {
   }
 
   async sendData(jsonObj) {
-    if (this.ws) {
-      this.ws.send(JSON.stringify(jsonObj));
+    return this.queueSend(jsonObj);
+  }
+
+  // Queue sends to ensure they happen sequentially
+  async queueSend(jsonObj) {
+    return new Promise((resolve, reject) => {
+      this.sendQueue.push({ jsonObj, resolve, reject });
+      this.processSendQueue();
+    });
+  }
+
+  async processSendQueue() {
+    // If already processing, return - the current processor will handle queued items
+    if (this.isSending) {
+      return;
     }
+
+    this.isSending = true;
+
+    while (this.sendQueue.length > 0) {
+      const { jsonObj, resolve, reject } = this.sendQueue.shift();
+
+      try {
+        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === 1)) {
+          const jsonStr = JSON.stringify(jsonObj);
+
+          // Use sendAsync if available (WASM WebSocket), otherwise use regular send
+          // sendAsync will block if the write queue is full (backpressure)
+          // but otherwise returns immediately, allowing pipelining
+          if (typeof this.ws.sendAsync === 'function') {
+            await this.ws.sendAsync(jsonStr);
+          } else {
+            this.ws.send(jsonStr);
+          }
+
+          resolve();
+        } else {
+          reject(new Error('WebSocket not open'));
+        }
+      } catch (err) {
+        reject(err);
+      }
+
+      // No artificial delay - let backpressure handle flow control
+    }
+
+    this.isSending = false;
   }
 
   async startWebSocketProxy() {
@@ -216,22 +262,22 @@ export class SocksServer {
                         console.log(`[${connectionId}] WebSocket writer sending ${chunk.length} bytes`);
                         console.log(`[${connectionId}] WebSocket readyState: ${ws.readyState} (OPEN=${WebSocket.OPEN || WASMWebSocket.OPEN || 1})`);
                         if (ws.readyState === WebSocket.OPEN || ws.readyState === 1) {
-                          ws.send(JSON.stringify({
+                          await this.queueSend({
                             type: 'data',
                             connectionId: connectionId,
                             data: btoa(String.fromCharCode.apply(null, chunk))
-                          }));
+                          });
                         } else {
                           console.warn(`[${connectionId}] Cannot send data - WebSocket not open (state=${ws.readyState})`);
                         }
                       },
-                      close: () => {
+                      close: async () => {
                         console.log(`[${connectionId}] WebSocket writer closing`);
                         if (ws.readyState === WebSocket.OPEN) {
-                          ws.send(JSON.stringify({
+                          await this.queueSend({
                             type: 'close',
                             connectionId: connectionId
-                          }));
+                          });
                         }
                         connections.delete(connectionId);
                       }
@@ -250,10 +296,10 @@ export class SocksServer {
             } catch (e) {
               console.error('Connection failed:', e);
               if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
+                await this.queueSend({
                   type: 'close',
                   connectionId: data.connectionId
-                }));
+                });
               }
             }
           } else if (data.type === 'data' || data.type === 'close') {

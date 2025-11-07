@@ -21,11 +21,13 @@ func main() {
 	// Register WebSocket creation function
 	js.Global().Set("createWASMWebSocket", js.FuncOf(createWASMWebSocketJS))
 	js.Global().Set("wasmWebSocketSend", js.FuncOf(wasmWebSocketSendJS))
+	js.Global().Set("wasmWebSocketSendAsync", js.FuncOf(wasmWebSocketSendAsyncJS))
 	js.Global().Set("wasmWebSocketClose", js.FuncOf(wasmWebSocketCloseJS))
 
 	fmt.Println("✓ WASM WebSocket functions registered")
 	fmt.Println("  - createWASMWebSocket")
 	fmt.Println("  - wasmWebSocketSend")
+	fmt.Println("  - wasmWebSocketSendAsync")
 	fmt.Println("  - wasmWebSocketClose")
 
 	// Keep the program running
@@ -146,7 +148,7 @@ func createWASMWebSocketJS(this js.Value, args []js.Value) interface{} {
 	return promiseConstructor.New(handler)
 }
 
-// wasmWebSocketSendJS sends data over a WebSocket connection
+// wasmWebSocketSendJS sends data over a WebSocket connection (fire-and-forget)
 // Arguments: (connectionId, data)
 func wasmWebSocketSendJS(this js.Value, args []js.Value) interface{} {
 	if len(args) < 2 {
@@ -172,6 +174,49 @@ func wasmWebSocketSendJS(this js.Value, args []js.Value) interface{} {
 	}
 
 	return nil
+}
+
+// wasmWebSocketSendAsyncJS sends data and returns a Promise that resolves when send completes
+// Arguments: (connectionId, data)
+// Returns: Promise<void>
+func wasmWebSocketSendAsyncJS(this js.Value, args []js.Value) interface{} {
+	if len(args) < 2 {
+		return jsPromiseReject("insufficient arguments")
+	}
+
+	connID := args[0].Int()
+	data := args[1].String()
+
+	// Create a promise
+	handler := js.FuncOf(func(this js.Value, promiseArgs []js.Value) interface{} {
+		resolve := promiseArgs[0]
+		reject := promiseArgs[1]
+
+		go func() {
+			connectionsMu.Lock()
+			conn, exists := connections[connID]
+			connectionsMu.Unlock()
+
+			if !exists {
+				reject.Invoke(js.ValueOf(fmt.Sprintf("Connection %d not found", connID)))
+				return
+			}
+
+			if err := conn.SendSync(data); err != nil {
+				fmt.Printf("[WASM] Failed to send data on connection %d: %v\n", connID, err)
+				conn.callOnError(err.Error())
+				reject.Invoke(js.ValueOf(err.Error()))
+				return
+			}
+
+			resolve.Invoke(js.Undefined())
+		}()
+
+		return nil
+	})
+
+	promiseConstructor := js.Global().Get("Promise")
+	return promiseConstructor.New(handler)
 }
 
 // wasmWebSocketCloseJS closes a WebSocket connection

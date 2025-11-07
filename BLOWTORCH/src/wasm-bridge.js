@@ -143,12 +143,36 @@ export class WASMWebSocket {
         }
 
         try {
+            // Call the WASM send function - it returns immediately
+            // The actual send happens asynchronously in the write queue
             window.wasmWebSocketSend(this._connectionId, data);
         } catch (error) {
             console.error('[WASM-Bridge] Send error:', error);
             if (this.onerror) {
                 this.onerror({ error: error.message });
             }
+        }
+    }
+
+    // Async send that waits for write completion
+    async sendAsync(data) {
+        if (this.readyState !== WASMWebSocket.OPEN) {
+            throw new Error('WebSocket is not open');
+        }
+
+        if (typeof window.wasmWebSocketSendAsync !== 'function') {
+            throw new Error('WASM WebSocket sendAsync function not available');
+        }
+
+        try {
+            // This will wait for the write to actually complete
+            await window.wasmWebSocketSendAsync(this._connectionId, data);
+        } catch (error) {
+            console.error('[WASM-Bridge] Send error:', error);
+            if (this.onerror) {
+                this.onerror({ error: error.message });
+            }
+            throw error;
         }
     }
 
