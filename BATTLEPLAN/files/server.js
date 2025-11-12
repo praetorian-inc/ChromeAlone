@@ -630,6 +630,13 @@ class RelayServer {
                             connectionId: data.connectionId
                         });
                         this.cleanupConnection(data.connectionId);
+                    } else if (!connection && data.type === 'close') {
+                        // Silently ignore close messages for non-existent connections
+                        // This is expected during connection teardown race conditions
+                        logger.debug({
+                            event: 'late_close',
+                            connectionId: data.connectionId
+                        });
                     } else if (!connection && data.type === 'data') {
                         logger.debug({
                             event: 'late_data',

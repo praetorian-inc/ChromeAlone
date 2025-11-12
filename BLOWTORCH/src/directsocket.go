@@ -17,6 +17,7 @@ type DirectSocket struct {
 	socketID   int
 	readBuffer []byte
 	closed     bool
+	closeMu    sync.RWMutex // Protects closed flag and socketID
 }
 
 // NewDirectSocket creates a new socket connection using Direct Sockets API
@@ -90,11 +91,16 @@ func NewDirectSocket(network, address string) (*DirectSocket, error) {
 
 // Read implements net.Conn
 func (ds *DirectSocket) Read(b []byte) (n int, err error) {
-	if ds.closed {
+	ds.closeMu.RLock()
+	closed := ds.closed
+	socketID := ds.socketID
+	ds.closeMu.RUnlock()
+
+	if closed {
 		return 0, io.EOF
 	}
 
-	if ds.socketID == -1 {
+	if socketID == -1 {
 		return 0, errors.New("socket not connected")
 	}
 
@@ -141,7 +147,7 @@ func (ds *DirectSocket) Read(b []byte) (n int, err error) {
 	})
 	defer callback.Release()
 
-	helper.Call("readSocket", ds.socketID, callback)
+	helper.Call("readSocket", socketID, callback)
 
 	wg.Wait()
 
@@ -160,11 +166,16 @@ func (ds *DirectSocket) Read(b []byte) (n int, err error) {
 
 // Write implements net.Conn
 func (ds *DirectSocket) Write(b []byte) (n int, err error) {
-	if ds.closed {
+	ds.closeMu.RLock()
+	closed := ds.closed
+	socketID := ds.socketID
+	ds.closeMu.RUnlock()
+
+	if closed {
 		return 0, errors.New("socket closed")
 	}
 
-	if ds.socketID == -1 {
+	if socketID == -1 {
 		return 0, errors.New("socket not connected")
 	}
 
@@ -192,7 +203,7 @@ func (ds *DirectSocket) Write(b []byte) (n int, err error) {
 	})
 	defer callback.Release()
 
-	helper.Call("writeSocket", ds.socketID, uint8Array, callback)
+	helper.Call("writeSocket", socketID, uint8Array, callback)
 
 	wg.Wait()
 
@@ -205,12 +216,18 @@ func (ds *DirectSocket) Write(b []byte) (n int, err error) {
 
 // Close implements net.Conn
 func (ds *DirectSocket) Close() error {
+	ds.closeMu.Lock()
 	if ds.closed {
+		socketID := ds.socketID
+		ds.closeMu.Unlock()
+		fmt.Printf("[DirectSocket] Close called on already-closed socket %d\n", socketID)
 		return nil
 	}
 	ds.closed = true
+	socketID := ds.socketID
+	ds.closeMu.Unlock()
 
-	if ds.socketID == -1 {
+	if socketID == -1 {
 		return nil
 	}
 
@@ -226,7 +243,7 @@ func (ds *DirectSocket) Close() error {
 	})
 	defer callback.Release()
 
-	helper.Call("closeSocket", ds.socketID, callback)
+	helper.Call("closeSocket", socketID, callback)
 
 	wg.Wait()
 

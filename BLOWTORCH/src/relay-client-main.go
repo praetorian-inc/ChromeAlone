@@ -10,28 +10,123 @@ import (
 
 var (
 	connections   = make(map[int]*WebSocketConnection)
+	proxies       = make(map[int]*RelayProxy)
 	nextConnID    = 1
 	connectionsMu sync.Mutex
+
+	// Global callback handlers (single instance, route by connection ID)
+	globalOnMessage js.Func
+	globalOnClose   js.Func
+	globalOnError   js.Func
+	globalOnOpen    js.Func
 )
 
 func main() {
 	fmt.Println("BLOWTORCH Relay Client WASM Module Loaded")
 	fmt.Println("=========================================")
 
-	// Register WebSocket creation function
+	// Create single global callback handlers that route by connection ID
+	initGlobalHandlers()
+
+	// Register WebSocket creation function (automatically includes relay proxy)
 	js.Global().Set("createWASMWebSocket", js.FuncOf(createWASMWebSocketJS))
 	js.Global().Set("wasmWebSocketSend", js.FuncOf(wasmWebSocketSendJS))
 	js.Global().Set("wasmWebSocketSendAsync", js.FuncOf(wasmWebSocketSendAsyncJS))
 	js.Global().Set("wasmWebSocketClose", js.FuncOf(wasmWebSocketCloseJS))
 
-	fmt.Println("✓ WASM WebSocket functions registered")
-	fmt.Println("  - createWASMWebSocket")
+	fmt.Println("✓ WASM functions registered")
+	fmt.Println("  - createWASMWebSocket (WebSocket + integrated relay proxy)")
 	fmt.Println("  - wasmWebSocketSend")
 	fmt.Println("  - wasmWebSocketSendAsync")
 	fmt.Println("  - wasmWebSocketClose")
 
 	// Keep the program running
 	select {}
+}
+
+// initGlobalHandlers creates single global callback handlers that route by connection ID
+func initGlobalHandlers() {
+	// Single onMessage handler for all connections
+	globalOnMessage = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		if len(args) < 2 {
+			return nil
+		}
+		connID := args[0].Int()
+		data := args[1].String()
+
+		// Route to relay proxy first (handles relay protocol)
+		connectionsMu.Lock()
+		proxy, exists := proxies[connID]
+		connectionsMu.Unlock()
+
+		if exists {
+			proxy.HandleMessage(data)
+		}
+
+		// Also route to JavaScript handler if registered
+		handlers := js.Global().Get("wasmWebSocketMessageHandlers")
+		if !handlers.IsUndefined() {
+			handler := handlers.Get(fmt.Sprintf("%d", connID))
+			if !handler.IsUndefined() {
+				handler.Invoke(data)
+			}
+		}
+		return nil
+	})
+
+	// Single onClose handler for all connections
+	globalOnClose = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		if len(args) < 1 {
+			return nil
+		}
+		connID := args[0].Int()
+
+		// Route to JavaScript handler if registered
+		handlers := js.Global().Get("wasmWebSocketCloseHandlers")
+		if !handlers.IsUndefined() {
+			handler := handlers.Get(fmt.Sprintf("%d", connID))
+			if !handler.IsUndefined() {
+				handler.Invoke()
+			}
+		}
+
+		// Clean up connection and proxy
+		connectionsMu.Lock()
+		delete(connections, connID)
+		delete(proxies, connID)
+		connectionsMu.Unlock()
+
+		return nil
+	})
+
+	// Single onError handler for all connections
+	globalOnError = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		if len(args) < 2 {
+			return nil
+		}
+		connID := args[0].Int()
+		errorMsg := args[1].String()
+
+		// Route to JavaScript handler if registered
+		handlers := js.Global().Get("wasmWebSocketErrorHandlers")
+		if !handlers.IsUndefined() {
+			handler := handlers.Get(fmt.Sprintf("%d", connID))
+			if !handler.IsUndefined() {
+				handler.Invoke(errorMsg)
+			}
+		}
+		return nil
+	})
+
+	// Single onOpen handler for all connections
+	globalOnOpen = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		if len(args) < 1 {
+			return nil
+		}
+		connID := args[0].Int()
+		fmt.Printf("[WASM] Connection %d opened\n", connID)
+		return nil
+	})
 }
 
 // createWASMWebSocketJS creates a new WebSocket connection
@@ -68,68 +163,31 @@ func createWASMWebSocketJS(this js.Value, args []js.Value) interface{} {
 				return
 			}
 
-			// Store connection and generate ID
+			// Store connection and generate ID first
 			connectionsMu.Lock()
 			connID := nextConnID
 			nextConnID++
 			connections[connID] = conn
 			connectionsMu.Unlock()
 
-			fmt.Printf("[WASM] WebSocket connection %d established\n", connID)
+			// Store the connection ID in the connection object for routing
+			conn.SetConnectionID(connID)
 
-			// Set up callbacks to call JavaScript handlers
-			conn.onMessage = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-				if len(args) > 0 {
-					data := args[0].String()
-					// Call JavaScript message handler
-					handlers := js.Global().Get("wasmWebSocketMessageHandlers")
-					if !handlers.IsUndefined() {
-						handler := handlers.Get(fmt.Sprintf("%d", connID))
-						if !handler.IsUndefined() {
-							handler.Invoke(data)
-						}
-					}
-				}
-				return nil
-			})
+			// Set callbacks to the global handlers (shared across all connections)
+			conn.onMessage = globalOnMessage
+			conn.onClose = globalOnClose
+			conn.onError = globalOnError
+			conn.onOpen = globalOnOpen
 
-			conn.onClose = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-				// Call JavaScript close handler
-				handlers := js.Global().Get("wasmWebSocketCloseHandlers")
-				if !handlers.IsUndefined() {
-					handler := handlers.Get(fmt.Sprintf("%d", connID))
-					if !handler.IsUndefined() {
-						handler.Invoke()
-					}
-				}
+			// Create relay proxy
+			proxy := NewRelayProxy(conn)
 
-				// Clean up connection
-				connectionsMu.Lock()
-				delete(connections, connID)
-				connectionsMu.Unlock()
+			// Store proxy
+			connectionsMu.Lock()
+			proxies[connID] = proxy
+			connectionsMu.Unlock()
 
-				return nil
-			})
-
-			conn.onError = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-				if len(args) > 0 {
-					errorMsg := args[0].String()
-					// Call JavaScript error handler
-					handlers := js.Global().Get("wasmWebSocketErrorHandlers")
-					if !handlers.IsUndefined() {
-						handler := handlers.Get(fmt.Sprintf("%d", connID))
-						if !handler.IsUndefined() {
-							handler.Invoke(errorMsg)
-						}
-					}
-				}
-				return nil
-			})
-
-			conn.onOpen = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-				fmt.Printf("[WASM] Connection %d opened\n", connID)
-				return nil
-			})
+			fmt.Printf("[WASM] WebSocket connection %d established with integrated relay proxy\n", connID)
 
 			// Trigger onOpen callback
 			conn.callOnOpen()
