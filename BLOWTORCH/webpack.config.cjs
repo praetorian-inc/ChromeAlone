@@ -101,7 +101,7 @@ const config = {
                     noErrorOnMissing: true
                 },
                 {
-                    from: 'src/wasm/socket-helper.js',
+                    from: 'src/socket-helper.js',
                     to: 'socket-helper.js',
                     noErrorOnMissing: true
                 }

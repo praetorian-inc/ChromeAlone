@@ -50,9 +50,9 @@ type WebSocketConfig struct {
 func NewWebSocketConnection(config WebSocketConfig) (*WebSocketConnection, error) {
 	ws := &WebSocketConnection{
 		closeSignal: make(chan struct{}),
-		writeQueue:  make(chan []byte, 1000), // Reduced buffer to limit memory usage
+		writeQueue:  make(chan []byte, 1000),
 		writeDone:   make(chan struct{}),
-		readQueue:   make(chan string, 1000), // Reduced buffer to limit memory usage
+		readQueue:   make(chan string, 1000),
 		readDone:    make(chan struct{}),
 	}
 
@@ -210,14 +210,8 @@ func NewWebSocketConnection(config WebSocketConfig) (*WebSocketConnection, error
 		return nil
 	})
 
-	// DON'T set a custom ping handler - let gorilla/websocket use its default
-	// The default ping handler automatically sends pongs inline during ReadMessage()
-	// This is safe because ReadMessage() is only called from readLoop (single goroutine)
-
-	// Start reading messages
+	// Start read and write loops
 	go ws.readLoop()
-
-	// Start dedicated writer goroutine for serialized writes
 	go ws.writeLoop()
 
 	// Start message dispatcher that calls JS callbacks in order
