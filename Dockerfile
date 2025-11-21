@@ -78,13 +78,21 @@ RUN ARCH=$(dpkg --print-architecture) && \
     ./aws/install && \
     rm -rf aws awscliv2.zip
 
+# Install Google Cloud SDK
+RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | \
+    tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+    gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
+    apt-get update && apt-get install -y google-cloud-sdk && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install Terraform (HashiCorp repo supports both architectures automatically)
 RUN wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | tee /usr/share/keyrings/hashicorp-archive-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/hashicorp.list \
     && apt-get update && apt-get install -y terraform
 
-# Create directory for AWS credentials
-RUN mkdir -p /root/.aws
+# Create directories for AWS and GCP credentials
+RUN mkdir -p /root/.aws /root/.config/gcloud
 
 # Copy the build script
 COPY build.sh /build.sh

@@ -6,18 +6,24 @@ DOMAIN_NAME=""
 APP_NAME="com.chrome.alone"
 OUTPUT_NAME="sideloader.ps1"
 TFVARS_FILE=""
-AWS_REGION="us-east-2"  # Default region
+REGION=""  # Will be set based on provider if not specified
+PROVIDER="aws"  # Default provider
+GCP_PROJECT=""  # GCP project (required for GCP provider)
+FRONT_DOMAIN="client2.google.com"  # Default front domain for domain fronting
 
 # Function to display usage information
 show_usage() {
-  echo "Usage: $0 [--domain=example.com] [--appname=com.chrome.alone] [--output=sideloader.ps1] [--tfvars=path/to/terraform.tfvars] [--region=us-east-2]"
+  echo "Usage: $0 [--domain=example.com] [--appname=com.chrome.alone] [--output=sideloader.ps1] [--tfvars=path/to/terraform.tfvars] [--region=REGION] [--provider=aws|gcp] [--project=GCP_PROJECT] [--front-domain=DOMAIN]"
   echo ""
   echo "Arguments:"
-  echo "  --domain=DOMAIN    Domain name for the relay server (required unless --tfvars is provided)"
-  echo "  --appname=NAME     Custom app name (optional, default: com.chrome.alone)"
-  echo "  --output=NAME      Output file name (optional, default: sideloader.ps1)"
-  echo "  --tfvars=PATH      Path to existing terraform.tfvars file (skips terraform deployment)"
-  echo "  --region=REGION    AWS region for deployment (optional, default: us-east-2)"
+  echo "  --domain=DOMAIN       Domain name for the relay server (required unless --tfvars is provided)"
+  echo "  --appname=NAME        Custom app name (optional, default: com.chrome.alone)"
+  echo "  --output=NAME         Output file name (optional, default: sideloader.ps1)"
+  echo "  --tfvars=PATH         Path to existing terraform.tfvars file (skips terraform deployment)"
+  echo "  --region=REGION       Region for deployment (optional, defaults: us-east-2 for AWS, us-central1 for GCP)"
+  echo "  --provider=PROVIDER   Cloud provider (optional, default: aws, options: aws|gcp)"
+  echo "  --project=PROJECT     GCP project ID (required when using --provider=gcp)"
+  echo "  --front-domain=DOMAIN Domain to use for fronting (optional, default: client2.google.com for GCP, empty for AWS)"
   echo ""
 }
 
@@ -41,7 +47,19 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --region=*)
-      AWS_REGION="${1#*=}"
+      REGION="${1#*=}"
+      shift
+      ;;
+    --provider=*)
+      PROVIDER="${1#*=}"
+      shift
+      ;;
+    --project=*)
+      GCP_PROJECT="${1#*=}"
+      shift
+      ;;
+    --front-domain=*)
+      FRONT_DOMAIN="${1#*=}"
       shift
       ;;
     --help|-h)
@@ -70,12 +88,39 @@ if [ -n "$TFVARS_FILE" ] && [ ! -f "$TFVARS_FILE" ]; then
   exit 1
 fi
 
+# Set default region based on provider if not specified
+if [ -z "$REGION" ]; then
+  if [ "$PROVIDER" == "aws" ]; then
+    REGION="us-east-2"
+  elif [ "$PROVIDER" == "gcp" ]; then
+    REGION="us-central1"
+  fi
+fi
+
+# Validate provider
+if [ "$PROVIDER" != "aws" ] && [ "$PROVIDER" != "gcp" ]; then
+  echo "Error: Invalid provider '$PROVIDER'. Must be 'aws' or 'gcp'"
+  show_usage
+  exit 1
+fi
+
+# Validate GCP project is provided when using GCP
+if [ "$PROVIDER" == "gcp" ] && [ -z "$GCP_PROJECT" ] && [ -z "$TFVARS_FILE" ]; then
+  echo "Error: --project is required when using --provider=gcp"
+  show_usage
+  exit 1
+fi
+
 if [ -n "$TFVARS_FILE" ]; then
   echo "Using existing TFVARs file: $TFVARS_FILE"
 else
   echo "Domain Name: $DOMAIN_NAME"
 fi
-echo "AWS Region: $AWS_REGION"
+echo "Provider: $PROVIDER"
+echo "Region: $REGION"
+if [ "$PROVIDER" == "gcp" ] && [ -n "$GCP_PROJECT" ]; then
+  echo "GCP Project: $GCP_PROJECT"
+fi
 echo "App Name: ${APP_NAME:-Using default com.chrome.alone}"
 echo "Output Name: ${OUTPUT_NAME:-Using default sideloader.ps1}"
 
@@ -88,12 +133,26 @@ command_exists() {
 echo "Checking for required dependencies..."
 MISSING_DEPS=0
 
-for cmd in aws terraform npm node dotnet python3; do
+# Always check these
+for cmd in terraform npm node dotnet python3; do
   if ! command_exists $cmd; then
     echo "Error: $cmd is not installed or not in PATH"
     MISSING_DEPS=1
   fi
 done
+
+# Check provider-specific CLI
+if [ "$PROVIDER" == "aws" ]; then
+  if ! command_exists aws; then
+    echo "Error: aws CLI is not installed or not in PATH (required for AWS provider)"
+    MISSING_DEPS=1
+  fi
+elif [ "$PROVIDER" == "gcp" ]; then
+  if ! command_exists gcloud; then
+    echo "Error: gcloud CLI is not installed or not in PATH (required for GCP provider)"
+    MISSING_DEPS=1
+  fi
+fi
 
 if [ $MISSING_DEPS -eq 1 ]; then
   echo "Please install missing dependencies or use the Docker container"
@@ -114,6 +173,18 @@ fi
 PROJECT_ROOT=$(pwd)
 echo "Project root: $PROJECT_ROOT"
 
+# Step 0: Clone google-redirector if using GCP and it doesn't exist
+if [ "$PROVIDER" == "gcp" ] && [ -z "$TFVARS_FILE" ]; then
+  if [ ! -d "$PROJECT_ROOT/google-redirector" ]; then
+    echo "Step 0: Cloning google-redirector repository (required for GCP deployments)"
+    cd "$PROJECT_ROOT"
+    git clone https://github.com/praetorian-inc/google-redirector.git
+    echo "✓ google-redirector cloned successfully"
+  else
+    echo "Step 0: google-redirector directory already exists, skipping clone"
+  fi
+fi
+
 # Step 1: Deploy relay (skip if tfvars file provided)
 if [ -n "$TFVARS_FILE" ]; then
   echo "Step 1: Skipping terraform deployment (using provided TFVARs file)"
@@ -129,37 +200,86 @@ if [ -n "$TFVARS_FILE" ]; then
     echo "Copied TFVARs file to $DEST_TFVARS"
   fi
 else
-  echo "Step 1: Running .deploy-relay.sh from BATTLEPLAN/ directory"
+  echo "Step 1: Running deploy-relay.sh from BATTLEPLAN/ directory"
   cd "$PROJECT_ROOT/BATTLEPLAN"
-  bash ./deploy-relay.sh --domain "$DOMAIN_NAME" --region "$AWS_REGION"
+
+  # Build the deploy command with appropriate flags
+  DEPLOY_CMD="bash ./deploy-relay.sh --domain \"$DOMAIN_NAME\" --region \"$REGION\" --provider \"$PROVIDER\""
+  if [ "$PROVIDER" == "gcp" ] && [ -n "$GCP_PROJECT" ]; then
+    DEPLOY_CMD="$DEPLOY_CMD --project \"$GCP_PROJECT\""
+  fi
+
+  echo "Running: $DEPLOY_CMD"
+  eval $DEPLOY_CMD
 fi
 
 # Extract domain_name and relay_token from terraform.tfvars
-TFVARS_PATH="$PROJECT_ROOT/output/relay-deployment/terraform.tfvars"
+TFVARS_PATH="$PROJECT_ROOT/output/relay-deployment-${PROVIDER}/terraform.tfvars"
 if [ ! -f "$TFVARS_PATH" ]; then
   echo "Error: terraform.tfvars file not found at $TFVARS_PATH"
   exit 1
 fi
 
-# Extract values using grep and sed
-echo "Extracting configuration from terraform.tfvars..."
-EXTRACTED_DOMAIN=$(grep 'domain_name' "$TFVARS_PATH" | sed 's/domain_name = "\(.*\)"/\1/')
-EXTRACTED_TOKEN=$(grep 'relay_token' "$TFVARS_PATH" | sed 's/relay_token = "\(.*\)"/\1/')
+# Extract values based on provider
+echo "Extracting configuration from terraform outputs..."
+cd "$PROJECT_ROOT/output/relay-deployment-${PROVIDER}"
 
-if [ -z "$EXTRACTED_DOMAIN" ] || [ -z "$EXTRACTED_TOKEN" ]; then
-  echo "Error: Could not extract domain_name or relay_token from terraform.tfvars"
+EXTRACTED_TOKEN=$(grep 'relay_token' terraform.tfvars | sed 's/relay_token = "\(.*\)"/\1/')
+
+if [ -z "$EXTRACTED_TOKEN" ]; then
+  echo "Error: Could not extract relay_token from terraform.tfvars"
   exit 1
 fi
 
-echo "Extracted domain: $EXTRACTED_DOMAIN"
 echo "Extracted token: ${EXTRACTED_TOKEN:0:8}..." # Only show first 8 chars for security
+
+# Set WS_DOMAIN, FRONT_DOMAIN, and TARGET_HOST based on provider
+if [ "$PROVIDER" == "gcp" ]; then
+  # For GCP, get the redirector URL from terraform output
+  REDIRECTOR_URL=$(terraform output -raw redirector_url 2>/dev/null)
+
+  if [ -z "$REDIRECTOR_URL" ]; then
+    echo "Error: Could not extract redirector_url from terraform output"
+    exit 1
+  fi
+
+  # Extract hostname from redirector URL (remove https:// and port)
+  WS_DOMAIN=$(echo "$REDIRECTOR_URL" | sed 's|https://||' | sed 's|:443$||')
+  # TARGET_HOST is the redirector hostname
+  TARGET_HOST="$WS_DOMAIN"
+  # FRONT_DOMAIN was provided by user (or default client2.google.com)
+
+  echo "Redirector URL: $REDIRECTOR_URL"
+  echo "WS_DOMAIN: $WS_DOMAIN"
+  echo "FRONT_DOMAIN: $FRONT_DOMAIN"
+  echo "TARGET_HOST: $TARGET_HOST"
+
+elif [ "$PROVIDER" == "aws" ]; then
+  # For AWS, get domain from terraform.tfvars
+  EXTRACTED_DOMAIN=$(grep 'domain_name' terraform.tfvars | sed 's/domain_name = "\(.*\)"/\1/')
+
+  if [ -z "$EXTRACTED_DOMAIN" ]; then
+    echo "Error: Could not extract domain_name from terraform.tfvars"
+    exit 1
+  fi
+
+  WS_DOMAIN="$EXTRACTED_DOMAIN"
+  TARGET_HOST="$EXTRACTED_DOMAIN"
+  FRONT_DOMAIN=""  # No domain fronting for AWS
+
+  echo "Domain: $EXTRACTED_DOMAIN"
+  echo "WS_DOMAIN: $WS_DOMAIN"
+  echo "TARGET_HOST: $TARGET_HOST"
+fi
 
 # Create .env file for webpack
 ENV_FILE="$PROJECT_ROOT/BLOWTORCH/.env"
 echo "Creating .env file for webpack at $ENV_FILE"
 cat > "$ENV_FILE" << EOF
-WS_DOMAIN=$EXTRACTED_DOMAIN
+WS_DOMAIN=$WS_DOMAIN
 RELAY_TOKEN=$EXTRACTED_TOKEN
+FRONT_DOMAIN=$FRONT_DOMAIN
+TARGET_HOST=$TARGET_HOST
 EOF
 
 # Step 2: Install npm dependencies

@@ -1,5 +1,5 @@
 import { SocksServer } from './socks-server.js';
-import { isWASMWebSocketAvailable, configureWASMWebSocket } from './wasm-bridge.js';
+import { configureWASMWebSocket } from './wasm-bridge.js';
 
 let socksServer = null;
 
@@ -36,15 +36,14 @@ export async function startProxy() {
             socksServer.stop();
         }
 
-        // Check if WASM WebSocket is available
-        const useWASM = isWASMWebSocketAvailable();
+        // Always use WASM WebSocket implementation
         console.log("-".repeat(80));
-        console.log(`WebSocket Implementation: ${useWASM ? 'WASM (Direct Sockets)' : 'STANDARD (Browser WebSocket)'}`);
+        console.log(`WebSocket Implementation: WASM (Direct Sockets)`);
 
-        if (useWASM && frontDomain) {
+        if (frontDomain) {
             console.log(`Connection will be established to: ${frontDomain}:443`);
             console.log(`HTTP Host header will be: ${targetHost || process.env.WS_DOMAIN}`);
-        } else if (!useWASM) {
+        } else {
             console.log(`Connection will be established to: ${process.env.WS_DOMAIN}:443`);
         }
         console.log("-".repeat(80));
@@ -52,8 +51,7 @@ export async function startProxy() {
         socksServer = new SocksServer(
             {
                 "websocketUrl": wsUrl,
-                "relayToken": relayToken,
-                "useWASM": useWASM
+                "relayToken": relayToken
             }
         );
         updateStatus(`Creating WS Relay connection...`);

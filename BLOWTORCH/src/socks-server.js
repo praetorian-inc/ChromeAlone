@@ -5,7 +5,6 @@ export class SocksServer {
     this.port = options.port || 1080;
     this.websocketUrl = options.websocketUrl;
     this.relayToken = options.relayToken;
-    this.useWASM = options.useWASM || false;
     this.server = null;
     this.ws = null;
     this.reconnectAttempts = 0;
@@ -17,31 +16,6 @@ export class SocksServer {
     this.sendQueue = [];
     this.isSending = false;
     this.disconnectedBuffer = []; // Buffer messages during disconnection
-  }
-
-  async startLocalSOCKSProxy() {
-    try {
-      const server = new TCPServerSocket('::');
-      const {readable, localAddress, localPort} = await server.opened;
-      console.log(`Listening on ${localAddress} port ${localPort}`);
-
-      const reader = readable.getReader();
-
-      for (;;) {
-        const {value, done} = await reader.read();
-        if (done) {
-          console.log('Socket closed');
-          break;
-        }
-
-        await this.handleConnection(value);
-      }
-    } catch (err) {
-      console.error('Failed to start SOCKS server:', err);
-      throw err;
-    } finally {
-      reader.releaseLock();
-    }
   }
 
   async sendCommandResponse(command, payload, taskId) {
@@ -135,14 +109,9 @@ export class SocksServer {
 
       const url = new URL(this.websocketUrl);
 
-      // Use WASM WebSocket if available and enabled, otherwise fallback to standard WebSocket
-      if (this.useWASM) {
-        console.log('[SocksServer] Using WASM WebSocket implementation');
-        this.ws = new WASMWebSocket(url.toString(), [`token.${this.relayToken}`]);
-      } else {
-        console.log('[SocksServer] Using standard WebSocket implementation');
-        this.ws = new WebSocket(url.toString(), [`token.${this.relayToken}`]);
-      }
+      // Always use WASM WebSocket implementation (Direct Sockets)
+      console.log('[SocksServer] Using WASM WebSocket implementation');
+      this.ws = new WASMWebSocket(url.toString(), [`token.${this.relayToken}`]);
 
       const ws = this.ws;
       
@@ -158,9 +127,9 @@ export class SocksServer {
             dataLength: data.data ? data.data.length : 0
           });
 
-          // When using WASM, the relay proxy handles connect/data/close automatically
+          // The WASM relay proxy handles connect/data/close automatically
           // JavaScript only needs to handle command messages
-          if (this.useWASM && data.type !== 'command') {
+          if (data.type !== 'command') {
             // WASM relay proxy handles this - ignore in JavaScript
             return;
           }
@@ -558,243 +527,8 @@ export class SocksServer {
   }
 
   async start() {
-    if (this.websocketUrl) {
-      await this.startWebSocketProxy();
-    } else {
-      await this.startLocalSOCKSProxy();
-    }
-  }
-
-  async handleConnection(client) {
-    const {readable, writable, remoteAddress, remotePort} = await client.opened;
-    const reader = readable.getReader();
-    const writer = writable.getWriter();
-
-    try {
-      // Read SOCKS version
-      const { value: init, done } = await reader.read();
-      if (done) return;
-      
-      if (init[0] !== 0x05) { // SOCKS5
-        throw new Error('Unsupported SOCKS version');
-      }
-
-      // Send auth method response (no auth)
-      await writer.write(new Uint8Array([0x05, 0x00]));
-
-      // Read connection request
-      const { value: request } = await reader.read();
-      const cmd = request[1];
-      const atyp = request[3];
-
-      if (cmd !== 0x01) { // Only support CONNECT
-        throw new Error('Only CONNECT is supported');
-      }
-
-      let addr;
-      let port;
-
-      switch (atyp) {
-        case 0x01: // IPv4
-          addr = Array.from(request.slice(4, 8))
-            .map(x => x.toString())
-            .join('.');
-          port = (request[8] << 8) + request[9];
-          break;
-
-        case 0x03: // Domain name
-          const addrLen = request[4];
-          addr = new TextDecoder().decode(request.slice(5, 5 + addrLen));
-          port = (request[5 + addrLen] << 8) + request[5 + addrLen + 1];
-          break;
-
-        case 0x04: // IPv6
-          // Group bytes into 16-bit chunks and format properly
-          addr = Array.from(request.slice(4, 20))
-            .map(x => x.toString(16).padStart(2, '0'))
-            .reduce((acc, cur, i) => {
-              if (i % 2 === 0) {
-                acc.push(cur);
-              } else {
-                acc[acc.length - 1] += cur;
-              }
-              return acc;
-            }, [])
-            .join(':');
-          port = (request[20] << 8) + request[21];
-          console.log(`IPv6 Address: ${addr}, Port: ${port}`);
-          break;
-
-        default:
-          throw new Error(`Unsupported address type: ${atyp}`);
-      }
-
-      console.log(`Connecting to ${addr}:${port} (type: ${atyp})`);
-
-      // Allow for context switch before attempting connection
-      await Promise.resolve();
-
-      try {
-        // Connect to destination
-        const remote = new TCPSocket(addr, port);
-        const remoteConn = await remote.opened;
-        console.log(`Connected to ${addr}:${port}`);
-
-        // Send success response
-        await writer.write(new Uint8Array([
-          0x05, 0x00, 0x00, 0x01,
-          0, 0, 0, 0, // bound addr
-          0, 0        // bound port
-        ]));
-
-        const remoteReader = remoteConn.readable.getReader();
-        const remoteWriter = remoteConn.writable.getWriter();
-
-        // Start bidirectional proxy
-        await this.proxy(reader, writer, remoteReader, remoteWriter);
-
-      } catch (connectError) {
-        console.error('Failed to connect to remote:', connectError);
-        // Send connection failed response
-        await writer.write(new Uint8Array([
-          0x05, 0x04, 0x00, 0x01,  // 0x04 = host unreachable
-          0, 0, 0, 0,
-          0, 0
-        ]));
-        throw connectError; // Re-throw to trigger cleanup
-      }
-
-    } catch (err) {
-      console.error('Connection handler error:', err);
-    } finally {
-      try {
-        reader.releaseLock();
-        writer.releaseLock();
-      } catch (e) {
-        // Ignore errors if locks were already released
-      }
-    }
-  }
-
-  async proxy(clientReader, clientWriter, remoteReader, remoteWriter) {
-    const clientToRemote = this.pipeData(clientReader, remoteWriter, 'client->remote');
-    const remoteToClient = this.pipeData(remoteReader, clientWriter, 'remote->client');
-    
-    try {
-      // Wait for either direction to complete/fail
-      await Promise.race([clientToRemote, remoteToClient]);
-    } catch (err) {
-      console.error('Proxy error:', err);
-    } finally {
-      // Clean up all resources
-      try {
-        await Promise.allSettled([
-          clientWriter.close(),
-          clientReader.cancel(),
-          remoteWriter.close(),
-          remoteReader.cancel()
-        ]);
-      } catch (cleanupErr) {
-        console.error('Cleanup error:', cleanupErr);
-      }
-    }
-  }
-
-  async pipeData(reader, writer, direction) {
-    const chunkSize = 16384; // 16KB chunks for efficient transfer
-    const DISPLAY_BYTES = 0x20; // Number of bytes to display in hex dump
-    const BYTES_PER_ROW = 16;
-    let lastLogTime = Date.now();
-    let chunksSinceLog = 0;
-    let bytesSinceLog = 0;
-
-    function formatHexDump(buffer, length) {
-      let result = '';
-      for (let offset = 0; offset < length; offset += BYTES_PER_ROW) {
-        // Offset in hex
-        result += offset.toString(16).padStart(8, '0') + ': ';
-        
-        // Hex values
-        const rowBytes = Array.from(buffer.slice(offset, Math.min(offset + BYTES_PER_ROW, length)));
-        const hex = rowBytes
-          .map(b => b.toString(16).padStart(2, '0'))
-          .join(' ');
-        result += hex.padEnd(BYTES_PER_ROW * 3 - 1, ' ');
-        
-        // ASCII representation
-        result += '  |';
-        const ascii = rowBytes
-          .map(b => (b >= 32 && b <= 126) ? String.fromCharCode(b) : '.')
-          .join('');
-        result += ascii.padEnd(BYTES_PER_ROW, ' ');
-        result += '|\n';
-      }
-      return result;
-    }
-
-    try {
-      let totalBytes = 0;
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) {
-          console.log(`${direction}: Stream closed after ${totalBytes} bytes`);
-          break;
-        }
-
-        // Display hex dump of first bytes of every chunk
-        if (value.length > 0) {
-          const bytesToDisplay = Math.min(value.length, DISPLAY_BYTES);
-          console.log(`${direction} chunk ${totalBytes}:`);
-          console.log(formatHexDump(value, bytesToDisplay));
-        }
-
-        totalBytes += value.length;
-        chunksSinceLog++;
-        bytesSinceLog += value.length;
-
-        // Write with timeout to detect slowness
-        const writeStart = Date.now();
-        await writer.write(value);
-        const writeDuration = Date.now() - writeStart;
-
-        if (writeDuration > 100) {
-          console.warn(`${direction}: Slow write detected: ${writeDuration}ms for ${value.length} bytes`);
-        }
-
-        // Log throughput every second during active transfer
-        const now = Date.now();
-        if (now - lastLogTime >= 1000) {
-          const duration = (now - lastLogTime) / 1000;
-          const bytesPerSec = bytesSinceLog / duration;
-          console.log(`${direction}: ${chunksSinceLog} chunks, ${(bytesPerSec / 1024).toFixed(1)} KB/s, total: ${(totalBytes / 1024).toFixed(1)} KB`);
-          lastLogTime = now;
-          chunksSinceLog = 0;
-          bytesSinceLog = 0;
-        }
-
-        if (totalBytes % (1024 * 1024) === 0) {  // Log every MB
-          console.log(`${direction}: Transferred ${totalBytes / (1024 * 1024)}MB`);
-        }
-      }
-    } catch (err) {
-      if (err.name === 'NetworkError') {
-        console.log(`${direction}: Connection reset by peer:`, err.message);
-      } else {
-        console.error(`${direction}: Pipe error:`, {
-          name: err.name,
-          message: err.message,
-          stack: err.stack
-        });
-      }
-      throw err; // Re-throw to trigger cleanup
-    } finally {
-      try {
-        await writer.close();
-      } catch (closeErr) {
-        // Ignore close errors as the stream might already be closed
-      }
-    }
+    // Always use WebSocket relay with WASM
+    await this.startWebSocketProxy();
   }
 
   stop() {

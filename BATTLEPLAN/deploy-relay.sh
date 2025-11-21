@@ -3,7 +3,7 @@ set -e
 
 # Parse command line arguments
 DOMAIN_NAME=""
-AWS_REGION="us-east-2"  # Default region (matches build.sh default)
+REGION=""  # Will be set based on provider if not specified
 PROVIDER="aws"  # Default provider
 GCP_PROJECT=""  # GCP project override
 while [[ $# -gt 0 ]]; do
@@ -13,7 +13,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --region)
-      AWS_REGION="$2"
+      REGION="$2"
       shift 2
       ;;
     --provider)
@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: $0 [--domain domain.example.com] [--region aws-region] [--provider aws|gcp] [--project gcp-project-id]"
+      echo "Usage: $0 [--domain domain.example.com] [--region region] [--provider aws|gcp] [--project gcp-project-id]"
       exit 1
       ;;
   esac
@@ -44,6 +44,15 @@ if ! command -v terraform &> /dev/null; then
     exit 1
 fi
 
+# Set default regions based on provider if not specified
+if [[ -z "$REGION" ]]; then
+    if [[ "$PROVIDER" == "aws" ]]; then
+        REGION="us-east-2"
+    elif [[ "$PROVIDER" == "gcp" ]]; then
+        REGION="us-central1"
+    fi
+fi
+
 # Provider-specific checks
 if [[ "$PROVIDER" == "aws" ]]; then
     # Check for AWS CLI
@@ -57,6 +66,8 @@ if [[ "$PROVIDER" == "aws" ]]; then
         echo "AWS credentials not found. Run aws configure first."
         exit 1
     fi
+
+    echo "Using AWS region: $REGION"
 elif [[ "$PROVIDER" == "gcp" ]]; then
     # Check for gcloud CLI
     if ! command -v gcloud &> /dev/null; then
@@ -116,9 +127,8 @@ elif [[ "$PROVIDER" == "gcp" ]]; then
         fi
     done
 
-    GCP_REGION="${AWS_REGION:-us-central1}"  # Reuse AWS_REGION variable for GCP region
     echo "Using GCP project: $GCP_PROJECT"
-    echo "Using GCP region: $GCP_REGION"
+    echo "Using GCP region: $REGION"
 fi
 
 # Create deployment directory with provider-specific subdirectory
@@ -154,10 +164,10 @@ PROXY_PASS=$(openssl rand -base64 32)
 if [[ "$PROVIDER" == "aws" ]]; then
     # Create SSH key pair if it doesn't exist
     KEY_NAME="relay-proxy-key"
-    if ! aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" &> /dev/null; then
-        echo "Creating new SSH key pair in region $AWS_REGION..."
+    if ! aws ec2 describe-key-pairs --region "$REGION" --key-names "$KEY_NAME" &> /dev/null; then
+        echo "Creating new SSH key pair in region $REGION..."
         aws ec2 create-key-pair \
-            --region "$AWS_REGION" \
+            --region "$REGION" \
             --key-name "$KEY_NAME" \
             --query 'KeyMaterial' \
             --output text > "${KEY_NAME}.pem"
@@ -168,11 +178,10 @@ if [[ "$PROVIDER" == "aws" ]]; then
     CURRENT_IP=$(curl -s https://checkip.amazonaws.com)
     OFFICE_IP_RANGE="${CURRENT_IP}/32"
     echo "Detected IP address: $OFFICE_IP_RANGE"
-    echo "Using AWS region: $AWS_REGION"
 
     # Create terraform.tfvars
     cat > terraform.tfvars << EOF
-aws_region = "${AWS_REGION}"
+aws_region = "${REGION}"
 office_ip_range = "${OFFICE_IP_RANGE}"
 key_name = "${KEY_NAME}"
 relay_token = "${RELAY_TOKEN}"
@@ -186,7 +195,6 @@ elif [[ "$PROVIDER" == "gcp" ]]; then
     CURRENT_IP=$(curl -s https://checkip.amazonaws.com)
     OFFICE_IP_RANGE="${CURRENT_IP}/32"
     echo "Detected IP address: $OFFICE_IP_RANGE"
-    echo "Using GCP region: $GCP_REGION"
 
     # Check if default network exists
     CREATE_VPC="false"
@@ -198,8 +206,8 @@ elif [[ "$PROVIDER" == "gcp" ]]; then
     # Create terraform.tfvars for GCP
     cat > terraform.tfvars << EOF
 project_id = "${GCP_PROJECT}"
-region = "${GCP_REGION}"
-zone = "${GCP_REGION}-a"
+region = "${REGION}"
+zone = "${REGION}-a"
 office_ip_range = "${OFFICE_IP_RANGE}"
 relay_token = "${RELAY_TOKEN}"
 proxy_user = "${PROXY_USER}"
@@ -275,7 +283,7 @@ SOCKS5 Proxy: ${RELAY_IP}:1080
 Username: ${PROXY_USER}
 Password: ${PROXY_PASS}
 Relay Token: ${RELAY_TOKEN}
-SSH Command: gcloud compute ssh relay-server --zone=${GCP_REGION}-a
+SSH Command: gcloud compute ssh relay-server --zone=${REGION}-a
 
 Example SOCKS5 Configuration:
 ============================
@@ -305,5 +313,5 @@ EOF
     echo "  Direct IP: ${RELAY_IP}"
     echo ""
     echo "To view setup logs:"
-    echo "gcloud compute instances get-serial-port-output relay-server --zone=${GCP_REGION}-a"
+    echo "gcloud compute instances get-serial-port-output relay-server --zone=${REGION}-a"
 fi
