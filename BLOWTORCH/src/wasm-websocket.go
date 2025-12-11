@@ -43,6 +43,7 @@ type WebSocketConfig struct {
 	FrontDomain        string // Domain to connect to (for domain fronting)
 	TargetHost         string // Host header value
 	RelayToken         string // Authentication token
+	Fingerprint        string // Browser fingerprint hash for agent identification
 	InsecureSkipVerify bool   // Skip TLS verification
 }
 

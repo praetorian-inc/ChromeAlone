@@ -3,9 +3,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"syscall/js"
+	"time"
 )
 
 var (
@@ -34,11 +36,17 @@ func main() {
 	js.Global().Set("wasmWebSocketSendAsync", js.FuncOf(wasmWebSocketSendAsyncJS))
 	js.Global().Set("wasmWebSocketClose", js.FuncOf(wasmWebSocketCloseJS))
 
+	// Register fingerprint function
+	js.Global().Set("generateFingerprint", js.FuncOf(GenerateFingerprint))
+	js.Global().Set("getOrCreateFingerprint", js.FuncOf(GetOrCreateFingerprintJS))
+
 	fmt.Println("✓ WASM functions registered")
 	fmt.Println("  - createWASMWebSocket (WebSocket + integrated relay proxy)")
 	fmt.Println("  - wasmWebSocketSend")
 	fmt.Println("  - wasmWebSocketSendAsync")
 	fmt.Println("  - wasmWebSocketClose")
+	fmt.Println("  - generateFingerprint")
+	fmt.Println("  - getOrCreateFingerprint")
 
 	// Keep the program running
 	select {}
@@ -130,10 +138,10 @@ func initGlobalHandlers() {
 }
 
 // createWASMWebSocketJS creates a new WebSocket connection
-// Arguments: (url, frontDomain, targetHost, relayToken, insecureSkipVerify)
+// Arguments: (url, frontDomain, targetHost, relayToken, insecureSkipVerify, fingerprint)
 // Returns: Promise<connectionId>
 func createWASMWebSocketJS(this js.Value, args []js.Value) interface{} {
-	if len(args) < 5 {
+	if len(args) < 6 {
 		return jsPromiseReject("insufficient arguments")
 	}
 
@@ -142,6 +150,7 @@ func createWASMWebSocketJS(this js.Value, args []js.Value) interface{} {
 	targetHost := args[2].String()
 	relayToken := args[3].String()
 	insecureSkipVerify := args[4].Bool()
+	fingerprint := args[5].String()
 
 	// Create a promise
 	handler := js.FuncOf(func(this js.Value, promiseArgs []js.Value) interface{} {
@@ -189,8 +198,25 @@ func createWASMWebSocketJS(this js.Value, args []js.Value) interface{} {
 
 			fmt.Printf("[WASM] WebSocket connection %d established with integrated relay proxy\n", connID)
 
-			// Trigger onOpen callback
+			// Trigger onOpen callback first
 			conn.callOnOpen()
+
+			// Send registration message with fingerprint after a small delay
+			// to ensure WebSocket is fully ready
+			if fingerprint != "" {
+				fmt.Printf("[WASM] Preparing to send registration message with fingerprint: %s\n", fingerprint[:16]+"...")
+				go func() {
+					// Small delay to ensure connection is stable
+					time.Sleep(100 * time.Millisecond)
+					if err := sendRegistrationMessage(conn, fingerprint); err != nil {
+						fmt.Printf("[WASM] ERROR: Failed to send registration message: %v\n", err)
+					} else {
+						fmt.Printf("[WASM] Successfully queued registration message\n")
+					}
+				}()
+			} else {
+				fmt.Printf("[WASM] WARNING: No fingerprint provided, skipping registration\n")
+			}
 
 			// Note: readLoop already started in NewWebSocketConnection
 			fmt.Printf("[WASM] Connection %d ready (readLoop already running)\n", connID)
@@ -309,6 +335,149 @@ func jsPromiseReject(reason string) js.Value {
 		return nil
 	})
 	defer handler.Release()
+
+	promiseConstructor := js.Global().Get("Promise")
+	return promiseConstructor.New(handler)
+}
+
+// sendRegistrationMessage sends a registration message with fingerprint data
+func sendRegistrationMessage(conn *WebSocketConnection, fingerprintHash string) error {
+	fmt.Printf("[Registration] Starting registration process...\n")
+	fmt.Printf("[Registration] Using stored fingerprint hash: %s\n", fingerprintHash[:16]+"...")
+
+	// Try to get stored fingerprint data from localStorage
+	localStorage := js.Global().Get("localStorage")
+	storedFingerprintJSON := localStorage.Call("getItem", "blowtorch_fingerprint_data")
+
+	var fpData FingerprintData
+
+	if !storedFingerprintJSON.IsNull() && !storedFingerprintJSON.IsUndefined() {
+		// Use stored fingerprint data
+		fmt.Printf("[Registration] Using stored fingerprint data from localStorage\n")
+		if err := json.Unmarshal([]byte(storedFingerprintJSON.String()), &fpData); err != nil {
+			fmt.Printf("[Registration] ERROR parsing stored fingerprint, collecting new: %v\n", err)
+			// Fall back to collecting new fingerprint
+			jsonData, err := CollectFingerprint()
+			if err != nil {
+				fmt.Printf("[Registration] ERROR collecting fingerprint: %v\n", err)
+				return fmt.Errorf("failed to collect fingerprint: %w", err)
+			}
+			if err := json.Unmarshal(jsonData, &fpData); err != nil {
+				fmt.Printf("[Registration] ERROR parsing fingerprint: %v\n", err)
+				return fmt.Errorf("failed to parse fingerprint: %w", err)
+			}
+		}
+	} else {
+		// Collect full fingerprint data for first time
+		fmt.Printf("[Registration] No stored fingerprint data, collecting new...\n")
+		jsonData, err := CollectFingerprint()
+		if err != nil {
+			fmt.Printf("[Registration] ERROR collecting fingerprint: %v\n", err)
+			return fmt.Errorf("failed to collect fingerprint: %w", err)
+		}
+		fmt.Printf("[Registration] Collected %d bytes of fingerprint data\n", len(jsonData))
+
+		// Parse the fingerprint data
+		if err := json.Unmarshal(jsonData, &fpData); err != nil {
+			fmt.Printf("[Registration] ERROR parsing fingerprint: %v\n", err)
+			return fmt.Errorf("failed to parse fingerprint: %w", err)
+		}
+		fmt.Printf("[Registration] Parsed fingerprint data successfully\n")
+
+		// Store the full fingerprint data for future use
+		localStorage.Call("setItem", "blowtorch_fingerprint_data", string(jsonData))
+		fmt.Printf("[Registration] Stored fingerprint data in localStorage\n")
+	}
+
+	// Ensure we're using the stored hash (not a freshly generated one)
+	fpData.Hash = fingerprintHash
+
+	// Create registration message
+	type RegistrationMessage struct {
+		Type        string          `json:"type"`
+		Fingerprint FingerprintData `json:"fingerprint"`
+	}
+
+	regMsg := RegistrationMessage{
+		Type:        "register",
+		Fingerprint: fpData,
+	}
+
+	regJSON, err := json.Marshal(regMsg)
+	if err != nil {
+		fmt.Printf("[Registration] ERROR marshaling registration: %v\n", err)
+		return fmt.Errorf("failed to marshal registration message: %w", err)
+	}
+	fmt.Printf("[Registration] Registration message size: %d bytes\n", len(regJSON))
+
+	// Send registration message
+	fmt.Printf("[Registration] Sending registration message...\n")
+	if err := conn.Send(string(regJSON)); err != nil {
+		fmt.Printf("[Registration] ERROR sending: %v\n", err)
+		return fmt.Errorf("failed to send registration message: %w", err)
+	}
+
+	fmt.Printf("[Registration] ✓ Successfully sent registration with fingerprint: %s\n", fpData.Hash[:16]+"...")
+	fmt.Printf("[Registration] Client details - Platform: %s, UserAgent: %s\n", fpData.Platform, fpData.UserAgent)
+
+	return nil
+}
+
+// GetOrCreateFingerprintJS gets the fingerprint from localStorage or generates a new one
+// Returns: Promise<string> - the fingerprint hash
+func GetOrCreateFingerprintJS(this js.Value, args []js.Value) interface{} {
+	handler := js.FuncOf(func(this js.Value, promiseArgs []js.Value) interface{} {
+		resolve := promiseArgs[0]
+		reject := promiseArgs[1]
+
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					reject.Invoke(fmt.Sprintf("Panic in GetOrCreateFingerprintJS: %v", r))
+				}
+			}()
+
+			localStorage := js.Global().Get("localStorage")
+			if localStorage.IsUndefined() {
+				reject.Invoke("localStorage is not available")
+				return
+			}
+
+			// Try to get existing fingerprint
+			storedFingerprint := localStorage.Call("getItem", "blowtorch_fingerprint")
+			if !storedFingerprint.IsNull() && !storedFingerprint.IsUndefined() {
+				fingerprintStr := storedFingerprint.String()
+				if fingerprintStr != "" {
+					fmt.Printf("[Fingerprint] Using stored fingerprint: %s\n", fingerprintStr[:16]+"...")
+					resolve.Invoke(fingerprintStr)
+					return
+				}
+			}
+
+			// Generate new fingerprint
+			fmt.Println("[Fingerprint] No stored fingerprint found, generating new one...")
+			jsonData, err := CollectFingerprint()
+			if err != nil {
+				reject.Invoke(fmt.Sprintf("Failed to generate fingerprint: %v", err))
+				return
+			}
+
+			// Parse JSON to get hash
+			var fpData FingerprintData
+			if err := json.Unmarshal(jsonData, &fpData); err != nil {
+				reject.Invoke(fmt.Sprintf("Failed to parse fingerprint: %v", err))
+				return
+			}
+
+			// Store in localStorage
+			localStorage.Call("setItem", "blowtorch_fingerprint", fpData.Hash)
+			fmt.Printf("[Fingerprint] Generated and stored new fingerprint: %s\n", fpData.Hash[:16]+"...")
+
+			resolve.Invoke(fpData.Hash)
+		}()
+
+		return nil
+	})
 
 	promiseConstructor := js.Global().Get("Promise")
 	return promiseConstructor.New(handler)

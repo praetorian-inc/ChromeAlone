@@ -75,6 +75,20 @@ export class WASMWebSocket {
                 hasToken: !!this._config.relayToken
             });
 
+            // Get or create fingerprint before connecting
+            let fingerprint = '';
+            if (typeof window.getOrCreateFingerprint === 'function') {
+                try {
+                    fingerprint = await window.getOrCreateFingerprint();
+                    console.log('[WASM-Bridge] Using fingerprint:', fingerprint.substring(0, 16) + '...');
+                } catch (err) {
+                    console.error('[WASM-Bridge] Failed to get fingerprint:', err);
+                    // Continue without fingerprint - server will fall back to IP
+                }
+            } else {
+                console.warn('[WASM-Bridge] Fingerprint function not available');
+            }
+
             // Create the WASM WebSocket connection
             // This returns a connection ID that we'll use to interact with the WASM side
             this._connectionId = await window.createWASMWebSocket(
@@ -82,7 +96,8 @@ export class WASMWebSocket {
                 this._config.frontDomain,
                 this._config.targetHost,
                 this._config.relayToken,
-                this._config.insecureSkipVerify
+                this._config.insecureSkipVerify,
+                fingerprint
             );
 
             // Set up message handler

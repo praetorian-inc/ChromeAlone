@@ -30,7 +30,8 @@ go build -o "$SRC_DIR/relay-client.wasm" \
     relay-client-main.go \
     wasm-websocket.go \
     wasm-relay-proxy.go \
-    directsocket.go
+    directsocket.go \
+    fingerprint.go
 
 if [ $? -eq 0 ]; then
     echo "✓ WASM build successful: $(du -h "$SRC_DIR/relay-client.wasm" | cut -f1)"
