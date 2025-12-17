@@ -304,7 +304,7 @@ class RelayServer {
 
                 agentInfo.push({
                     fingerprint,
-                    ip: agent.remoteAddress,
+                    ip: agent.ip,
                     port: agent.port,
                     active: true,
                     connectionCount,
@@ -625,24 +625,9 @@ class RelayServer {
                         });
                         this.cleanupConnection(data.connectionId);
                     } else if (!connection && (data.type === 'close' || data.type === 'data')) {
-                        // Connection already cleaned up - send explicit close to client to stop retries
-                        // This happens when SOCKS client closes before agent finishes sending data
-                        logger.debug({
-                            event: data.type === 'close' ? 'late_close' : 'late_data',
-                            connectionId: data.connectionId,
-                            action: 'sending_close_to_stop_retries'
-                        });
-
-                        // Find agent and send close message
-                        for (const [fp, agent] of this.agents.entries()) {
-                            if (agent.ws === ws) {
-                                agent.ws.send(JSON.stringify({
-                                    type: 'close',
-                                    connectionId: data.connectionId
-                                }));
-                                break;
-                            }
-                        }
+                        // Connection already cleaned up - this is normal during async cleanup
+                        // Don't send close back as it can create message loops
+                        // Just ignore silently
                     } else {
                         logger.warn({
                             event: 'unhandled_message',
@@ -775,10 +760,38 @@ class RelayServer {
             }
         }
 
+        // Extract and validate ALL IPv4 addresses from fingerprint
+        const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+
+        // Debug: Log what we received
+        logger.debug({
+            event: 'fingerprint_ip_debug',
+            fingerprint,
+            receivedIpAddresses: fingerprintData.ipAddresses,
+            fingerprintDataKeys: Object.keys(fingerprintData)
+        });
+
+        let ipAddresses = [];
+        if (fingerprintData.ipAddresses && fingerprintData.ipAddresses.length > 0) {
+            // Filter for valid IPv4 addresses only
+            ipAddresses = fingerprintData.ipAddresses.filter(ip => ipv4Regex.test(ip));
+        }
+
+        // Concatenate all IPs with semicolon, or use WebSocket remote address as fallback
+        const concatenatedIPs = ipAddresses.length > 0 ? ipAddresses.join('; ') : unregistered.remoteAddress;
+
+        logger.debug({
+            event: 'fingerprint_ip_processed',
+            fingerprint,
+            validIpv4Count: ipAddresses.length,
+            concatenatedIPs
+        });
+
         // Create/update agent info
         const agentInfo = {
             ws,
             remoteAddress: unregistered.remoteAddress,
+            ip: concatenatedIPs,
             lastSeen: Date.now(),
             port: this.getPortForAgent(fingerprint),
             fingerprintData,
@@ -794,7 +807,8 @@ class RelayServer {
         logger.info({
             event: isReconnect ? 'agent_registered_reconnect' : 'agent_registered',
             fingerprint,
-            ip: unregistered.remoteAddress,
+            ip: concatenatedIPs,
+            remoteAddress: unregistered.remoteAddress,
             port: agentInfo.port,
             platform: fingerprintData.platform,
             userAgent: fingerprintData.userAgent

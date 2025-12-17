@@ -21,15 +21,11 @@ window.directSocketHelper = {
             });
             // Initialize write queue for this socket
             this.writeQueues.set(id, { queue: [], processing: false });
-            // Defer callback to next tick for WASM safety
-            setTimeout(() => {
-                callback(null, id); // Success: (error=null, socketId)
-            }, 0);
+            // Call immediately - no setTimeout overhead
+            callback(null, id); // Success: (error=null, socketId)
         }).catch(err => {
-            // Defer callback to next tick for WASM safety
-            setTimeout(() => {
-                callback(err.message || 'Connection failed', null); // Error: (error, socketId=null)
-            }, 0);
+            // Call immediately - no setTimeout overhead
+            callback(err.message || 'Connection failed', null); // Error: (error, socketId=null)
         });
     },
 
@@ -37,29 +33,21 @@ window.directSocketHelper = {
     async readSocket(id, callback) {
         const conn = this.sockets.get(id);
         if (!conn) {
-            setTimeout(() => {
-                callback('Socket closed', null);
-            }, 0);
+            callback('Socket closed', null);
             return;
         }
 
         try {
             const { value, done } = await conn.reader.read();
             if (done) {
-                setTimeout(() => {
-                    callback('EOF', null); // EOF - Go will interpret this as io.EOF
-                }, 0);
+                callback('EOF', null); // EOF - Go will interpret this as io.EOF
             } else {
-                setTimeout(() => {
-                    callback(null, value); // Success: (error=null, Uint8Array)
-                }, 0);
+                callback(null, value); // Success: (error=null, Uint8Array)
             }
         } catch (err) {
             // Remove socket on read error to prevent further operations
             this.sockets.delete(id);
-            setTimeout(() => {
-                callback(err.message || 'Read failed', null);
-            }, 0);
+            callback(err.message || 'Read failed', null);
         }
     },
 
@@ -68,9 +56,7 @@ window.directSocketHelper = {
     writeSocket(id, data, callback) {
         const queue = this.writeQueues.get(id);
         if (!queue) {
-            setTimeout(() => {
-                callback('Socket closed', null);
-            }, 0);
+            callback('Socket closed', null);
             return;
         }
 
@@ -101,36 +87,35 @@ window.directSocketHelper = {
                 const desiredSize = conn.writer.desiredSize;
                 if (desiredSize !== null && desiredSize <= 0) {
                     console.warn(`[DirectSocket ${id}] Backpressure detected, waiting... (queue: ${queue.queue.length})`);
-                    await Promise.race([
-                        conn.writer.ready,
-                        new Promise((_, reject) => setTimeout(() => reject(new Error('Backpressure timeout')), 5000))
-                    ]);
+                    // Wait for writer to be ready, no timeout - trust TCP backpressure
+                    await conn.writer.ready;
                 }
 
-                // Perform the write
-                await Promise.race([
-                    conn.writer.write(data),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('Write timeout')), 5000))
-                ]);
+                // Perform the write - no timeout, trust the socket to handle it
+                // Direct Sockets API has its own timeouts at the TCP layer
+                await conn.writer.write(data);
 
-                // Success callback
-                setTimeout(() => {
-                    callback(null, true);
-                }, 0);
+                // Success callback - call immediately
+                callback(null, true);
 
             } catch (err) {
-                console.error(`[DirectSocket ${id}] Write error: ${err.message}`);
-                // Error callback
-                setTimeout(() => {
-                    callback(err.message || 'Write failed', null);
-                }, 0);
+                // Check if this is a recoverable error (timeout vs hard failure)
+                const isTimeout = err.message.includes('timeout');
+                const isNetworkError = err.message.includes('network') || err.message.includes('connection');
+
+                if (isTimeout || isNetworkError) {
+                    console.warn(`[DirectSocket ${id}] Recoverable error: ${err.message}, closing socket`);
+                } else {
+                    console.error(`[DirectSocket ${id}] Write error: ${err.message}`);
+                }
+
+                // Error callback - call immediately
+                callback(err.message || 'Write failed', null);
 
                 // On error, fail all remaining writes in queue
                 while (queue.queue.length > 0) {
                     const { callback: failCallback } = queue.queue.shift();
-                    setTimeout(() => {
-                        failCallback('Socket error', null);
-                    }, 0);
+                    failCallback('Socket error', null);
                 }
 
                 // Clean up
@@ -147,9 +132,7 @@ window.directSocketHelper = {
     async closeSocket(id, callback) {
         const conn = this.sockets.get(id);
         if (!conn) {
-            setTimeout(() => {
-                callback(null, true); // Already closed
-            }, 0);
+            callback(null, true); // Already closed
             return;
         }
 
@@ -158,10 +141,10 @@ window.directSocketHelper = {
         if (queue && (queue.processing || queue.queue.length > 0)) {
             console.log(`[DirectSocket ${id}] Waiting for ${queue.queue.length} pending writes to complete before closing...`);
 
-            // Wait for queue to drain (with timeout)
+            // Wait for queue to drain (with shorter timeout - 1s instead of 3s)
             const startTime = Date.now();
-            while ((queue.processing || queue.queue.length > 0) && (Date.now() - startTime < 3000)) {
-                await new Promise(resolve => setTimeout(resolve, 10));
+            while ((queue.processing || queue.queue.length > 0) && (Date.now() - startTime < 1000)) {
+                await new Promise(resolve => setTimeout(resolve, 5)); // 5ms instead of 10ms
             }
 
             if (queue.processing || queue.queue.length > 0) {
@@ -182,7 +165,7 @@ window.directSocketHelper = {
                 try {
                     await Promise.race([
                         conn.reader.cancel(),
-                        new Promise((_, reject) => setTimeout(() => reject(new Error('Reader cancel timeout')), 1000))
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('Reader cancel timeout')), 500))
                     ]);
                 } catch (e) {
                     console.debug(`[DirectSocket ${id}] Reader cancel failed: ${e.message}`);
@@ -195,7 +178,7 @@ window.directSocketHelper = {
                 try {
                     await Promise.race([
                         conn.writer.abort(),
-                        new Promise((_, reject) => setTimeout(() => reject(new Error('Writer abort timeout')), 1000))
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('Writer abort timeout')), 500))
                     ]);
                 } catch (e) {
                     console.debug(`[DirectSocket ${id}] Writer abort failed: ${e.message}`);
@@ -206,20 +189,16 @@ window.directSocketHelper = {
             try {
                 await Promise.race([
                     conn.socket.close(),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('Socket close timeout')), 2000))
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('Socket close timeout')), 1000))
                 ]);
             } catch (e) {
                 console.debug(`[DirectSocket ${id}] Socket close failed: ${e.message}`);
             }
 
-            setTimeout(() => {
-                callback(null, true); // Success: (error=null, success=true)
-            }, 0);
+            callback(null, true); // Success: (error=null, success=true)
         } catch (err) {
             console.error(`[DirectSocket ${id}] Close error: ${err.message}`);
-            setTimeout(() => {
-                callback(err.message || 'Close failed', null);
-            }, 0);
+            callback(err.message || 'Close failed', null);
         }
     }
 };

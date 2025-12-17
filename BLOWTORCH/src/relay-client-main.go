@@ -345,14 +345,13 @@ func sendRegistrationMessage(conn *WebSocketConnection, fingerprintHash string) 
 	fmt.Printf("[Registration] Starting registration process...\n")
 	fmt.Printf("[Registration] Using stored fingerprint hash: %s\n", fingerprintHash[:16]+"...")
 
-	// Try to get stored fingerprint data from localStorage
 	localStorage := js.Global().Get("localStorage")
 	storedFingerprintJSON := localStorage.Call("getItem", "blowtorch_fingerprint_data")
 
 	var fpData FingerprintData
 
+	// Use stored fingerprint data if available
 	if !storedFingerprintJSON.IsNull() && !storedFingerprintJSON.IsUndefined() {
-		// Use stored fingerprint data
 		fmt.Printf("[Registration] Using stored fingerprint data from localStorage\n")
 		if err := json.Unmarshal([]byte(storedFingerprintJSON.String()), &fpData); err != nil {
 			fmt.Printf("[Registration] ERROR parsing stored fingerprint, collecting new: %v\n", err)
@@ -387,6 +386,17 @@ func sendRegistrationMessage(conn *WebSocketConnection, fingerprintHash string) 
 		// Store the full fingerprint data for future use
 		localStorage.Call("setItem", "blowtorch_fingerprint_data", string(jsonData))
 		fmt.Printf("[Registration] Stored fingerprint data in localStorage\n")
+	}
+
+	// Always detect fresh IP addresses
+	fmt.Printf("[Registration] Detecting current IP addresses via WebRTC...\n")
+	freshIPData, err := CollectFingerprint()
+	if err == nil {
+		var freshFP FingerprintData
+		if err := json.Unmarshal(freshIPData, &freshFP); err == nil {
+			fpData.IPAddresses = freshFP.IPAddresses
+			fmt.Printf("[Registration] Updated with %d current IP addresses\n", len(fpData.IPAddresses))
+		}
 	}
 
 	// Ensure we're using the stored hash (not a freshly generated one)

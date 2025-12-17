@@ -185,27 +185,30 @@ func (ds *DirectSocket) Write(b []byte) (n int, err error) {
 	uint8Array := js.Global().Get("Uint8Array").New(len(b))
 	js.CopyBytesToJS(uint8Array, b)
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-
+	done := make(chan struct{})
 	var writeErr error
 
 	callback := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		defer wg.Done()
-
 		// Args: (error, success)
 		if len(args) > 0 && !args[0].IsNull() {
 			// Error case
 			writeErr = errors.New(args[0].String())
 		}
-
+		close(done)
 		return nil
 	})
 	defer callback.Release()
 
 	helper.Call("writeSocket", socketID, uint8Array, callback)
 
-	wg.Wait()
+	// Wait for write to complete with a very long timeout (60 seconds)
+	// This allows large downloads to complete without timing out
+	select {
+	case <-done:
+		// Success or error
+	case <-time.After(60 * time.Second):
+		return 0, errors.New("write timeout after 60 seconds")
+	}
 
 	if writeErr != nil {
 		return 0, writeErr

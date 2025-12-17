@@ -128,7 +128,7 @@ func (p *RelayProxy) handleConnect(connID, targetHost string, targetPort int) {
 	proxyConn := &ProxyConnection{
 		id:         connID,
 		proxy:      p,
-		readBuffer: make(chan []byte, 50), // Small buffer - 50 packets max per connection
+		readBuffer: make(chan []byte, 500), // Increased buffer - 500 packets max per connection
 		done:       make(chan struct{}),
 	}
 
@@ -175,8 +175,11 @@ func (p *RelayProxy) handleConnect(connID, targetHost string, targetPort int) {
 func (c *ProxyConnection) readFromLocal() {
 	defer c.wg.Done()
 
-	// Use 64KB buffer for better throughput
-	buf := make([]byte, 65536)
+	// Use 16KB buffer - balance between throughput and message size
+	// Larger buffers cause issues with Direct Sockets under high load
+	buf := make([]byte, 16384)
+	consecutiveErrors := 0
+
 	for {
 		select {
 		case <-c.done:
@@ -215,9 +218,23 @@ func (c *ProxyConnection) readFromLocal() {
 			})
 			if err != nil {
 				fmt.Printf("[%s] Failed to send data to relay: %v\n", c.id, err)
-				c.close()
-				return
+				consecutiveErrors++
+
+				// If we're getting repeated send errors, the connection is unhealthy
+				// Close it to trigger reconnect
+				if consecutiveErrors > 3 {
+					fmt.Printf("[%s] Too many consecutive send errors, closing\n", c.id)
+					c.close()
+					return
+				}
+
+				// Brief pause before retry to avoid hammering a failing connection
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
+
+			// Reset error counter on success
+			consecutiveErrors = 0
 		}
 	}
 }

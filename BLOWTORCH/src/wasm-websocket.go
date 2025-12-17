@@ -51,7 +51,7 @@ type WebSocketConfig struct {
 func NewWebSocketConnection(config WebSocketConfig) (*WebSocketConnection, error) {
 	ws := &WebSocketConnection{
 		closeSignal: make(chan struct{}),
-		writeQueue:  make(chan []byte, 1000),
+		writeQueue:  make(chan []byte, 50), // Very small queue - fail fast rather than queue and corrupt
 		writeDone:   make(chan struct{}),
 		readQueue:   make(chan string, 1000),
 		readDone:    make(chan struct{}),
@@ -226,6 +226,11 @@ func NewWebSocketConnection(config WebSocketConfig) (*WebSocketConnection, error
 
 func (ws *WebSocketConnection) readLoop() {
 	defer func() {
+		// Catch any panics during read
+		if r := recover(); r != nil {
+			fmt.Printf("[WASM-WS] readLoop panic recovered: %v\n", r)
+		}
+
 		close(ws.readQueue) // Signal dispatcher to exit
 
 		// Only close if not already closed
@@ -246,7 +251,13 @@ func (ws *WebSocketConnection) readLoop() {
 		messageType, message, err := ws.wsConn.ReadMessage()
 		if err != nil {
 			if !ws.closed {
-				fmt.Printf("[WASM-WS] Read error: %v\n", err)
+				// Check if this is a TLS error (common during network issues)
+				errMsg := err.Error()
+				if contains(errMsg, "tls:") || contains(errMsg, "MAC") {
+					fmt.Printf("[WASM-WS] TLS error (network issue): %v\n", err)
+				} else {
+					fmt.Printf("[WASM-WS] Read error: %v\n", err)
+				}
 				ws.callOnError(err.Error())
 				ws.callOnClose()
 			}
@@ -274,6 +285,16 @@ func (ws *WebSocketConnection) readLoop() {
 	}
 }
 
+// Helper function to check if string contains substring
+func contains(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
 // messageDispatcher processes incoming messages sequentially and calls JS callbacks
 // This ensures messages are delivered in order while preventing readLoop blocking
 func (ws *WebSocketConnection) messageDispatcher() {
@@ -294,11 +315,23 @@ func (ws *WebSocketConnection) messageDispatcher() {
 // writeLoop is a dedicated goroutine that serializes all WebSocket writes
 // This is the gorilla/websocket recommended pattern for concurrent writes
 func (ws *WebSocketConnection) writeLoop() {
-	defer close(ws.writeDone)
+	defer func() {
+		// Catch any panics during write
+		if r := recover(); r != nil {
+			fmt.Printf("[WASM-WS] writeLoop panic recovered: %v\n", r)
+		}
+		close(ws.writeDone)
+	}()
 
 	for data := range ws.writeQueue {
 		if err := ws.wsConn.WriteMessage(websocket.TextMessage, data); err != nil {
-			fmt.Printf("[WASM-WS] Write error: %v\n", err)
+			errMsg := err.Error()
+			// Distinguish between network errors and other errors
+			if contains(errMsg, "timeout") || contains(errMsg, "tls:") || contains(errMsg, "MAC") {
+				fmt.Printf("[WASM-WS] Network error on write: %v\n", err)
+			} else {
+				fmt.Printf("[WASM-WS] Write error: %v\n", err)
+			}
 			// Drain remaining messages to prevent deadlock on Send()
 			go func() {
 				for range ws.writeQueue {
@@ -347,36 +380,62 @@ func (ws *WebSocketConnection) pingLoop() {
 
 // Send sends a text message over the WebSocket (non-blocking with timeout)
 func (ws *WebSocketConnection) Send(data string) error {
+	// Use defer/recover to catch any panic from sending on closed channel
+	defer func() {
+		if r := recover(); r != nil {
+			// Channel was closed, ignore the panic
+		}
+	}()
+
 	ws.mu.Lock()
-	if ws.closed {
-		ws.mu.Unlock()
-		return fmt.Errorf("connection closed")
-	}
+	closed := ws.closed
 	ws.mu.Unlock()
 
-	// Queue the message for the writer goroutine with timeout
-	// This prevents indefinite blocking if write queue is full
+	if closed {
+		return fmt.Errorf("connection closed")
+	}
+
+	// Queue the message for the writer goroutine with SHORT timeout
+	// Fail fast - if queue is backing up, connection is unhealthy
 	select {
 	case ws.writeQueue <- []byte(data):
 		return nil
+	case <-ws.closeSignal:
+		return fmt.Errorf("connection closed")
 	case <-time.After(2 * time.Second):
-		return fmt.Errorf("send timeout: write queue full (possible slow connection or backpressure)")
+		// Queue is full for 2 seconds = connection is unhealthy
+		// Close it to force reconnect rather than queue more data
+		fmt.Println("[WASM-WS] Write queue blocked for 2s, closing connection to prevent corruption")
+		go ws.Close()
+		return fmt.Errorf("send timeout: connection unhealthy, forcing reconnect")
 	}
 }
 
 // SendSync sends a text message and waits for the write to complete
 // This is used by sendAsync to ensure writes happen sequentially
 func (ws *WebSocketConnection) SendSync(data string) error {
+	// Use defer/recover to catch any panic from sending on closed channel
+	defer func() {
+		if r := recover(); r != nil {
+			// Channel was closed, ignore the panic
+		}
+	}()
+
 	ws.mu.Lock()
-	if ws.closed {
-		ws.mu.Unlock()
-		return fmt.Errorf("connection closed")
-	}
+	closed := ws.closed
 	ws.mu.Unlock()
 
+	if closed {
+		return fmt.Errorf("connection closed")
+	}
+
 	// Queue the message for the writer goroutine (blocking if full)
-	ws.writeQueue <- []byte(data)
-	return nil
+	select {
+	case ws.writeQueue <- []byte(data):
+		return nil
+	case <-ws.closeSignal:
+		return fmt.Errorf("connection closed")
+	}
 }
 
 // Close closes the WebSocket connection
